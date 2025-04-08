@@ -1,4 +1,7 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::BufReader;
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FunctionNode {
@@ -27,17 +30,29 @@ use petgraph::visit::Bfs;
 #[derive(Debug)]
 pub struct Graph {
     graph: DiGraph<FunctionNode, usize>, // 边权重为约束深度
+    // 缓存：(crate_name, crate_version) -> Vec<(function_path, NodeIndex)>
+    function_cache: HashMap<(String, String), Vec<(String, NodeIndex)>>,
 }
 
 impl Graph {
     pub fn new() -> Self {
         Graph {
             graph: DiGraph::new(),
+            function_cache: HashMap::new(),
         }
     }
 
     fn add_node(&mut self, node: FunctionNode) -> NodeIndex {
-        self.graph.add_node(node)
+        let node_index = self.graph.add_node(node.clone());
+        
+        // 更新缓存
+        let cache_key = (node.crate_name.clone(), node.crate_version.clone());
+        self.function_cache
+            .entry(cache_key)
+            .or_insert_with(Vec::new)
+            .push((node.function_path.clone(), node_index));
+            
+        node_index
     }
 
     fn add_edge(&mut self, from: NodeIndex, to: NodeIndex, constraint_depth: usize) {
@@ -69,7 +84,7 @@ impl Graph {
         
         // 3. 运行call-cg工具
         let _ = std::process::Command::new("call-cg")
-            .args(&["--find-callers-of", function_path])
+            .args(&["--find-callers", function_path])
             .output();
             
         // 4. 解析callers.txt
@@ -123,28 +138,30 @@ impl Graph {
         }
     }
 
+    // 从缓存中获取crate的所有函数节点
+    fn get_crate_functions_from_cache(&self, crate_name: &str, crate_version: &str) -> Option<&Vec<(String, NodeIndex)>> {
+        self.function_cache.get(&(crate_name.to_string(), crate_version.to_string()))
+    }
+
     // 修改后的analyze_downstream函数
     pub fn analyze_downstream(&mut self, upstream_crate: &str, upstream_version: &str, downstream_crates: &Vec<(String, String)>) {
-        // 获取当前图中属于upstream_crate的所有函数节点
-        let mut upstream_functions = Vec::new();
-        for node_index in self.graph.node_indices() {
-            let node = &self.graph[node_index];
-            if node.crate_name == upstream_crate && node.crate_version == upstream_crate {
-                upstream_functions.push((node_index, node.clone()));
-            }
-        }
+        // 先收集所有需要的信息
+        let upstream_functions: Vec<(String, NodeIndex)> = if let Some(functions) = self.get_crate_functions_from_cache(upstream_crate, upstream_version) {
+            functions.clone()
+        } else {
+            return;
+        };
 
         // 对每个下游crate，检查它是否调用了上游crate中图中的任何函数
         for (downstream_name, downstream_version) in downstream_crates {
             // 对上游crate中图中的每个函数，检查下游crate是否有调用
-            for (upstream_index, upstream_func) in &upstream_functions {
+            for (upstream_path, upstream_index) in &upstream_functions {
                 if let Some(callers_json) = self.download_and_analyze(
                     downstream_name,
                     downstream_version,
-                    &upstream_func.function_path
+                    upstream_path
                 ) {
                     for callee in callers_json.callee {
-                        // 只处理来自当前下游crate的调用
                         if callee.name == *downstream_name {
                             let callee_node = FunctionNode {
                                 crate_name: callee.name.clone(),
@@ -153,7 +170,6 @@ impl Graph {
                             };
                             
                             let callee_index = self.add_node(callee_node);
-                            // 从上游函数节点连接到下游函数节点
                             self.add_edge(*upstream_index, callee_index, callee.constraint_depth);
                         }
                     }
@@ -162,15 +178,73 @@ impl Graph {
         }
     }
 
-    // 获取某个crate在图中的所有函数节点
-    pub fn get_crate_functions(&self, crate_name: &str) -> Vec<FunctionNode> {
-        let mut functions = Vec::new();
-        for node_index in self.graph.node_indices() {
-            let node = &self.graph[node_index];
-            if node.crate_name == crate_name {
-                functions.push(node.clone());
+
+    pub fn get_crate_functions(&self, crate_name: &str, crate_version: &str) -> Vec<FunctionNode> {
+        if let Some(cached_functions) = self.get_crate_functions_from_cache(crate_name, crate_version) {
+            cached_functions
+                .iter()
+                .map(|(_, node_index)| self.graph[*node_index].clone())
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    // 统一的函数调用图分析函数
+    pub fn analyze_function_calls(&mut self, json_file: &str) -> std::io::Result<()> {
+        // 读取JSON文件
+        let file = File::open(json_file)?;
+        let reader = BufReader::new(file);
+        let dependencies: Vec<DependencyInfo> = serde_json::from_reader(reader)?;
+
+        // 处理第一个crate（CVE所在的crate）
+        if let Some(cve_crate) = dependencies.first() {
+            // 创建CVE函数节点
+            let cve_node = FunctionNode {
+                crate_name: cve_crate.crate_name.clone(),
+                crate_version: cve_crate.version.clone(),
+                function_path: cve_crate.function.clone(), // 需要在DependencyInfo中添加这个字段
+            };
+            
+            let cve_index = self.add_node(cve_node);
+            
+            // 分析CVE所在crate的内部调用
+            self.process_upstream_function(
+                &cve_crate.crate_name,
+                &cve_crate.version,
+                &cve_crate.cve_function,
+                cve_index
+            );
+
+            // 分析依赖关系
+            for dep_info in dependencies {
+                let crate_name = &dep_info.crate_name;
+                let crate_version = &dep_info.version;
+                
+                // 获取当前crate在图中的所有函数
+                let functions = self.get_crate_functions(crate_name, crate_version);
+                
+                // 分析每个函数
+                for func in functions {
+                    // 分析直接依赖的下游crates
+                    self.analyze_downstream(
+                        crate_name,
+                        crate_version,
+                        &dep_info.dependents
+                    );
+                }
             }
         }
-        functions
+
+        Ok(())
     }
+}
+
+// 修改DependencyInfo结构体
+#[derive(Debug, Serialize, Deserialize)]
+struct DependencyInfo {
+    crate_name: String,
+    version: String,
+    dependents: Vec<(String, String)>, // (crate_name, version)
+    cve_function: Option<String>, // 如果是CVE所在的crate，这个字段会有值
 } 
