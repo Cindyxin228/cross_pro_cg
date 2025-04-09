@@ -1,30 +1,27 @@
-mod callgraph;
-use callgraph::{Graph, FunctionNode};
+mod dependency_analyzer;
+use dependency_analyzer::DependencyAnalyzer;
+
+use std::fs::File;
+use std::io::Write;
+use tracing::{info, warn, error, debug, trace};
+use tracing_subscriber::EnvFilter;
+
 fn main() {
-    let mut graph = Graph::new();
-
-    // 1. 分析上游CVE所在crate的内部调用
-    let vulnerable_node = FunctionNode {
-        crate_name: "vulnerable_crate".to_string(),
-        crate_version: "1.0.0".to_string(),
-        function_path: "vulnerable_function".to_string(),
-    };
-    graph.process_upstream_function(&vulnerable_node.crate_name, &vulnerable_node.crate_version, &vulnerable_node.function_path, 0.into());
-
-    // // 2. 手动指定直接依赖的下游crates
-    // let direct_dependents = vec![
-    //     ("dependent_crate1".to_string(), "0.1.0".to_string()),
-    //     ("dependent_crate2".to_string(), "0.2.0".to_string()),
-    // ];
-
-    // // 3. 分析直接依赖的下游crates中对vulnerable_function的调用
-    // let downstream_functions = graph.analyze_downstream(&vulnerable_node, &direct_dependents);
-
-    // // 4. 如果需要继续分析下一层依赖，可以手动指定新的下游crates
-    // for downstream_func in downstream_functions {
-    //     let new_dependents = vec![
-    //         // 手动指定依赖于downstream_func.crate_name的crates
-    //     ];
-    //     graph.analyze_downstream(&downstream_func, &new_dependents);
-    // }
+    // 初始化tracing
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::DEBUG.into()))
+        .init();
+    
+    info!("开始分析依赖关系");
+    let mut analyzer = DependencyAnalyzer::new("cindy", "crates_io_db");
+    
+    info!("测试 serde 的版本范围 ^1.0 的叶子节点");
+    let leaf_nodes = analyzer.find_all_dependents("ring", "<0.17.12", "ring::aead::Nonce::assume_unique_for_key");
+    info!("找到的叶子节点数量: {}", leaf_nodes.len());
+    info!("叶子节点列表:");
+    for node in leaf_nodes {
+        info!("  {}:{}", node.name, node.version);
+    }
+    
+    info!("分析完成");
 }
