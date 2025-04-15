@@ -282,54 +282,30 @@ impl DependencyAnalyzer {
             }
         }
         
-        // 检查call-cg4rs命令是否存在
-        let which_result = Command::new("which")
-            .arg("call-cg4rs")
-            .output();
-            
-        if let Ok(output) = which_result {
-            if output.status.success() {
-                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                info!("call-cg4rs 命令路径: {}", path);
-            } else {
-                warn!("找不到 call-cg4rs 命令");
-            }
-        } else {
-            warn!("无法执行 which 命令: {}", which_result.err().unwrap());
-        }
-        
-        // 检查call-cg4rs的帮助信息
-        let help_result = Command::new("call-cg4rs")
-            .arg("--help")
-            .output();
-            
-        if let Ok(output) = help_result {
-            if output.status.success() {
-                let help = String::from_utf8_lossy(&output.stdout);
-                info!("call-cg4rs 帮助信息:\n{}", help);
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                warn!("获取 call-cg4rs 帮助信息失败: {}", stderr);
-            }
-        } else {
-            warn!("无法执行 call-cg4rs --help: {}", help_result.err().unwrap());
-        }
-        
-        // 手动创建target目录
-        let target_dir = Path::new("target");
-        if !target_dir.exists() {
-            info!("手动创建target目录");
-            if let Err(e) = fs::create_dir(target_dir) {
-                warn!("创建target目录失败: {}", e);
-            } else {
-                info!("成功创建target目录");
-            }
-        }
-        
         // 运行call-cg4rs工具
         info!("运行call-cg4rs工具");
+        
+        // 检查tmp目录权限
+        let tmp_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        info!("当前工作目录: {}", tmp_dir.display());
+        
+        // 检查目录权限
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(metadata) = fs::metadata(&tmp_dir) {
+                let permissions = metadata.permissions();
+                let mode = permissions.mode();
+                info!("目录权限: {:o}", mode);
+                
+                // 检查是否有写权限
+                let is_writable = mode & 0o200 != 0;
+                info!("目录是否可写: {}", is_writable);
+            }
+        }
+
         let call_cg_result = Command::new("call-cg4rs")
-            .args(&["--find-callers-of", function_path, "--json-output", "--quiet"])
+            .args(&["--find-callers", function_path, "--json-output"])  // 移除 --quiet 以查看更多输出
             .output();
             
         if let Err(e) = call_cg_result {
@@ -358,7 +334,19 @@ impl DependencyAnalyzer {
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             info!("call-cg4rs输出长度: {}", stdout.len());
             
-            // 检查./target/目录中的callers.json文件
+            // 记录运行call-cg4rs后的目录内容
+            info!("运行call-cg4rs后的目录内容:");
+            if let Ok(entries) = fs::read_dir(".") {
+                for entry in entries {
+                    if let Ok(entry) = entry {
+                        if let Ok(path) = entry.path().into_os_string().into_string() {
+                            info!("  {}", path);
+                        }
+                    }
+                }
+            }
+            
+            // 检查当前目录中的target目录（在解压后的项目目录中）
             let target_dir = Path::new("target");
             if target_dir.exists() {
                 info!("target目录存在");
@@ -396,6 +384,9 @@ impl DependencyAnalyzer {
                                     info!("crate {} {} 调用了函数 {} (调用者数量: {})", 
                                         crate_name, crate_version, function_path, total_callers);
                                     
+                                    // 保存callers.json内容
+                                    let callers_content = content.clone();
+                                    
                                     // 返回上级目录
                                     if std::env::set_current_dir("..").is_err() {
                                         warn!("无法返回上级目录");
@@ -412,7 +403,7 @@ impl DependencyAnalyzer {
                                         warn!("无法返回原始工作目录: {}", original_dir.display());
                                     }
                                     
-                                    return Some(content);
+                                    return Some(callers_content);
                                 }
                             }
                         }
@@ -421,163 +412,9 @@ impl DependencyAnalyzer {
                     }
                 } else {
                     warn!("callers.json文件不存在: {}", callers_json_path.display());
-                    
-                    // 尝试使用不同的参数运行call-cg4rs
-                    info!("尝试使用不同的参数运行call-cg4rs");
-                    let alt_result = Command::new("call-cg4rs")
-                        .args(&["--find-callers-of", function_path, "--json-output"])
-                        .output();
-                        
-                    if let Ok(output) = alt_result {
-                        info!("call-cg4rs (无--quiet) 退出码: {}", output.status);
-                        
-                        if output.status.success() {
-                            let stdout = String::from_utf8_lossy(&output.stdout);
-                            info!("call-cg4rs (无--quiet) 输出:\n{}", stdout);
-                            
-                            // 再次检查callers.json文件
-                            if callers_json_path.exists() {
-                                info!("callers.json文件现在存在");
-                                
-                                // 读取callers.json文件内容
-                                if let Ok(content) = fs::read_to_string(&callers_json_path) {
-                                    info!("callers.json 内容:");
-                                    if let Ok(json) = serde_json::from_str::<Value>(&content) {
-                                        info!("{}", serde_json::to_string_pretty(&json).unwrap_or_default());
-                                    } else {
-                                        info!("{}", content);
-                                    }
-                                    
-                                    // 解析JSON并检查total_callers
-                                    if let Ok(json) = serde_json::from_str::<Value>(&content) {
-                                        if let Some(total_callers) = json.get("total_callers").and_then(|v| v.as_i64()) {
-                                            if total_callers > 0 {
-                                                info!("crate {} {} 调用了函数 {} (调用者数量: {})", 
-                                                    crate_name, crate_version, function_path, total_callers);
-                                                
-                                                // 返回上级目录
-                                                if std::env::set_current_dir("..").is_err() {
-                                                    warn!("无法返回上级目录");
-                                                }
-                                                
-                                                // 清理下载的压缩包和解压后的项目文件夹
-                                                let _ = std::fs::remove_file(format!("{}-{}.crate", crate_name, crate_version));
-                                                let _ = Command::new("rm")
-                                                    .args(&["-rf", &crate_dir])
-                                                    .output();
-                                                
-                                                // 返回原始工作目录
-                                                if std::env::set_current_dir(&original_dir).is_err() {
-                                                    warn!("无法返回原始工作目录: {}", original_dir.display());
-                                                }
-                                                
-                                                return Some(content);
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    warn!("无法读取callers.json文件: {}", callers_json_path.display());
-                                }
-                            } else {
-                                warn!("callers.json文件仍然不存在: {}", callers_json_path.display());
-                            }
-                        } else {
-                            let stderr = String::from_utf8_lossy(&output.stderr);
-                            warn!("call-cg4rs (无--quiet) 执行失败: {}", stderr);
-                        }
-                    } else {
-                        warn!("运行call-cg4rs (无--quiet) 失败: {}", alt_result.err().unwrap());
-                    }
                 }
             } else {
                 warn!("target目录不存在");
-                
-                // 尝试使用不同的参数运行call-cg4rs
-                info!("尝试使用不同的参数运行call-cg4rs");
-                let alt_result = Command::new("call-cg4rs")
-                    .args(&["--find-callers-of", function_path, "--json-output"])
-                    .output();
-                    
-                if let Ok(output) = alt_result {
-                    info!("call-cg4rs (无--quiet) 退出码: {}", output.status);
-                    
-                    if output.status.success() {
-                        let stdout = String::from_utf8_lossy(&output.stdout);
-                        info!("call-cg4rs (无--quiet) 输出:\n{}", stdout);
-                        
-                        // 再次检查target目录
-                        if target_dir.exists() {
-                            info!("target目录现在存在");
-                            
-                            // 列出target目录内容
-                            if let Ok(entries) = fs::read_dir(target_dir) {
-                                info!("target目录内容:");
-                                for entry in entries {
-                                    if let Ok(entry) = entry {
-                                        if let Ok(path) = entry.path().into_os_string().into_string() {
-                                            info!("  {}", path);
-                                        }
-                                    }
-                                }
-                            }
-                            
-                            // 检查callers.json文件
-                            let callers_json_path = target_dir.join("callers.json");
-                            if callers_json_path.exists() {
-                                info!("callers.json文件现在存在");
-                                
-                                // 读取callers.json文件内容
-                                if let Ok(content) = fs::read_to_string(&callers_json_path) {
-                                    info!("callers.json 内容:");
-                                    if let Ok(json) = serde_json::from_str::<Value>(&content) {
-                                        info!("{}", serde_json::to_string_pretty(&json).unwrap_or_default());
-                                    } else {
-                                        info!("{}", content);
-                                    }
-                                    
-                                    // 解析JSON并检查total_callers
-                                    if let Ok(json) = serde_json::from_str::<Value>(&content) {
-                                        if let Some(total_callers) = json.get("total_callers").and_then(|v| v.as_i64()) {
-                                            if total_callers > 0 {
-                                                info!("crate {} {} 调用了函数 {} (调用者数量: {})", 
-                                                    crate_name, crate_version, function_path, total_callers);
-                                                
-                                                // 返回上级目录
-                                                if std::env::set_current_dir("..").is_err() {
-                                                    warn!("无法返回上级目录");
-                                                }
-                                                
-                                                // 清理下载的压缩包和解压后的项目文件夹
-                                                let _ = std::fs::remove_file(format!("{}-{}.crate", crate_name, crate_version));
-                                                let _ = Command::new("rm")
-                                                    .args(&["-rf", &crate_dir])
-                                                    .output();
-                                                
-                                                // 返回原始工作目录
-                                                if std::env::set_current_dir(&original_dir).is_err() {
-                                                    warn!("无法返回原始工作目录: {}", original_dir.display());
-                                                }
-                                                
-                                                return Some(content);
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    warn!("无法读取callers.json文件: {}", callers_json_path.display());
-                                }
-                            } else {
-                                warn!("callers.json文件仍然不存在: {}", callers_json_path.display());
-                            }
-                        } else {
-                            warn!("target目录仍然不存在");
-                        }
-                    } else {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        warn!("call-cg4rs (无--quiet) 执行失败: {}", stderr);
-                    }
-                } else {
-                    warn!("运行call-cg4rs (无--quiet) 失败: {}", alt_result.err().unwrap());
-                }
             }
             
             // 返回上级目录
