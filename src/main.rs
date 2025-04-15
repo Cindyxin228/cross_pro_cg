@@ -34,7 +34,7 @@ fn main() {
     
     // 分析 ring crate 的依赖关系
     info!("分析 ring crate 的依赖关系");
-    let leaf_nodes = analyzer.find_all_dependents("ring", "<0.17.12", "ring::aead::Nonce::assume_unique_for_key");
+    let leaf_nodes = analyzer.find_all_dependents("crossbeam-channel", ">=0.5.11, <0.5.15", "crossbeam_channel::flavors::list::Channel::discard_all_messages");
     
     // 输出结果
     info!("找到的叶子节点数量: {}", leaf_nodes.len());
