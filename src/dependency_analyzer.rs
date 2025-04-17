@@ -289,20 +289,6 @@ impl DependencyAnalyzer {
         let tmp_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         info!("当前工作目录: {}", tmp_dir.display());
         
-        // 检查目录权限
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(metadata) = fs::metadata(&tmp_dir) {
-                let permissions = metadata.permissions();
-                let mode = permissions.mode();
-                info!("目录权限: {:o}", mode);
-                
-                // 检查是否有写权限
-                let is_writable = mode & 0o200 != 0;
-                info!("目录是否可写: {}", is_writable);
-            }
-        }
 
         let call_cg_result = Command::new("call-cg4rs")
             .args(&["--find-callers", function_path, "--json-output"])  // 移除 --quiet 以查看更多输出
@@ -483,7 +469,7 @@ impl DependencyAnalyzer {
         let mut handles = vec![];
         
         // 创建线程池
-        let num_threads = 32; // 可以根据需要调整线程数
+        let num_threads = 64; // 可以根据需要调整线程数
         let nodes_per_thread = (nodes.lock().unwrap().len() + num_threads - 1) / num_threads;
         
         for thread_id in 0..num_threads {
