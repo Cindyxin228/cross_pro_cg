@@ -1,13 +1,18 @@
-use futures::{stream, StreamExt};
-use semver::{Version, VersionReq};
-use serde_json::Value;
 use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+use anyhow::Result;
+use futures::{stream, StreamExt};
+use semver::{Version, VersionReq};
+use serde_json::Value;
 use tokio::fs as tokio_fs;
 use tokio::process::Command;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
+
+use crate::database::Database;
+use crate::krate::Krate;
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct CrateVersion {
@@ -24,217 +29,15 @@ pub struct DependencyNode {
 
 #[derive(Debug, Clone)]
 pub struct DependencyAnalyzer {
-    db_user: String,
-    db_name: String,
+    database: Arc<Database>,
 }
 
 impl DependencyAnalyzer {
-    pub fn new(db_user: &str, db_name: &str) -> Self {
-        info!(
-            "初始化 DependencyAnalyzer: db_user={}, db_name={}",
-            db_user, db_name
-        );
-
-        DependencyAnalyzer {
-            db_user: db_user.to_string(),
-            db_name: db_name.to_string(),
-        }
-    }
-
-    // 查询某个crate的所有版本
-    async fn query_crate_versions(&self, crate_name: &str) -> Vec<String> {
-        info!("查询crate {} 的所有版本", crate_name);
-
-        let query = format!(
-            "SELECT DISTINCT v.num 
-             FROM versions v 
-             JOIN crates c ON v.crate_id = c.id 
-             WHERE c.name = '{}' 
-             ORDER BY v.num;",
-            crate_name
-        );
-
-        info!("执行SQL查询: {}", query);
-
-        let output = Command::new("psql")
-            .args(&["-U", &self.db_user, "-d", &self.db_name, "-c", &query, "-t"])
-            .output()
-            .await
-            .expect("Failed to execute psql command");
-
-        let output_str = String::from_utf8_lossy(&output.stdout);
-        info!("数据库查询结果: {}", output_str);
-
-        let versions: Vec<String> = output_str
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| line.trim().to_string())
-            .collect();
-
-        info!("找到 {} 个版本: {:?}", versions.len(), versions);
-        versions
-    }
-
-    // 查询依赖某个crate的所有crates
-    async fn query_dependents(&self, crate_name: &str) -> Vec<(String, String, String)> {
-        info!("查询依赖 {} 的所有crates", crate_name);
-
-        let query = format!(
-            "WITH target_crate AS (
-                SELECT id FROM crates WHERE name = '{}'
-            )
-            SELECT DISTINCT c.name, v.num, d.req
-            FROM dependencies d
-            JOIN versions v ON d.version_id = v.id
-            JOIN crates c ON v.crate_id = c.id
-            WHERE d.crate_id = (SELECT id FROM target_crate)
-            AND d.req IS NOT NULL
-            ORDER BY c.name, v.num;",
-            crate_name
-        );
-
-        info!("执行SQL查询: {}", query);
-
-        let output = Command::new("psql")
-            .args(&["-U", &self.db_user, "-d", &self.db_name, "-c", &query, "-t"])
-            .output()
-            .await
-            .expect("Failed to execute psql command");
-
-        let output_str = String::from_utf8_lossy(&output.stdout);
-        //info!("原始数据库查询结果: \n{}", output_str);
-
-        let dependents: Vec<(String, String, String)> = output_str
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .filter_map(|line| {
-                let parts: Vec<&str> = line.split('|').collect();
-                if parts.len() == 3 {
-                    let name = parts[0].trim().to_string();
-                    let version = parts[1].trim().to_string();
-                    let req = parts[2].trim().to_string();
-                    Some((name, version, req))
-                } else {
-                    warn!("无法解析行: {}", line);
-                    None
-                }
-            })
-            .collect();
-
-        info!("找到 {} 个依赖者", dependents.len());
-        dependents
-    }
-
-    // 下载并解压crate
-    async fn download_and_extract_crate(&self, crate_name: &str, crate_version: &str) -> bool {
-        info!("下载并解压 crate: {} {}", crate_name, crate_version);
-
-        // 使用临时目录
-        let temp_dir = std::env::temp_dir();
-        info!("使用临时目录: {}", temp_dir.display());
-
-        // 切换到临时目录
-        if std::env::set_current_dir(&temp_dir).is_err() {
-            warn!("无法切换到临时目录: {}", temp_dir.display());
-            return false;
-        }
-
-        let crate_file = format!("{}-{}.crate", crate_name, crate_version);
-        let crate_dir = format!("{}-{}", crate_name, crate_version);
-
-        // 检查目录是否已存在
-        if Path::new(&crate_dir).exists() {
-            info!("目录 {} 已存在，直接使用", crate_dir);
-            return true;
-        }
-
-        // 检查文件是否已存在
-        if Path::new(&crate_file).exists() {
-            info!("文件 {} 已存在，直接使用", crate_file);
-        } else {
-            // 下载crate
-            info!("下载 crate: {}", crate_file);
-            let curl_path = "/usr/bin/curl";
-            let download_result = Command::new(curl_path)
-                .args(&[
-                    "-L",
-                    &format!(
-                        "https://crates.io/api/v1/crates/{}/{}/download",
-                        crate_name, crate_version
-                    ),
-                ])
-                .arg("-o")
-                .arg(&crate_file)
-                .output()
-                .await;
-
-            if let Err(e) = download_result {
-                warn!("下载 crate {} 失败: {}", crate_file, e);
-                return false;
-            }
-
-            // 检查下载的文件是否存在
-            if !Path::new(&crate_file).exists() {
-                warn!("下载后文件 {} 不存在", crate_file);
-                return false;
-            }
-
-            // 检查文件大小
-            if let Ok(metadata) = tokio_fs::metadata(&crate_file).await {
-                let size = metadata.len();
-                info!("下载的文件大小: {} 字节", size);
-                if size == 0 {
-                    warn!("下载的文件大小为0，可能下载失败");
-                    return false;
-                }
-            } else {
-                warn!("无法获取文件 {} 的元数据", crate_file);
-                return false;
-            }
-        }
-
-        // 解压crate
-        info!("解压 crate: {}", crate_file);
-
-        let extract_result = Command::new("tar")
-            .args(&["-xf", &crate_file])
-            .output()
-            .await;
-
-        if let Err(e) = extract_result {
-            warn!("解压 crate {} 失败: {}", crate_file, e);
-            return false;
-        }
-
-        // 检查解压命令的输出
-        if let Ok(output) = extract_result {
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                warn!("解压命令失败: {}", stderr);
-                return false;
-            }
-        }
-
-        // 检查目录是否存在
-        if !Path::new(&crate_dir).exists() {
-            warn!("解压后目录 {} 不存在", crate_dir);
-
-            // 尝试列出当前目录内容
-            if let Ok(mut entries) = tokio_fs::read_dir(".").await {
-                info!("当前目录内容:");
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    if let Ok(path) = entry.path().into_os_string().into_string() {
-                        info!("  {}", path);
-                    }
-                }
-            }
-
-            return false;
-        }
-
-        // 注意：这里不返回原始工作目录，让调用者决定何时返回
-        info!("成功下载并解压 crate: {} {}", crate_name, crate_version);
-        true
+    pub async fn new() -> Result<Self> {
+        let database = Database::new().await?;
+        Ok(Self {
+            database: Arc::new(database),
+        })
     }
 
     // 检查crate是否调用了指定的函数，并返回callers.txt的内容
@@ -249,28 +52,28 @@ impl DependencyAnalyzer {
             crate_name, crate_version, function_path
         );
 
+        let krate = Krate::new(crate_name.to_string(), crate_version.to_string());
+
         // 保存原始工作目录
         let original_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         info!("原始工作目录: {}", original_dir.display());
 
         // 下载并解压crate
-        if !self
-            .download_and_extract_crate(crate_name, crate_version)
-            .await
-        {
-            warn!("无法下载或解压 crate: {} {}", crate_name, crate_version);
-            // 返回原始工作目录
-            if std::env::set_current_dir(&original_dir).is_err() {
-                warn!("无法返回原始工作目录: {}", original_dir.display());
+        let crate_dir = match krate.get_crate_dir_path().await {
+            Ok(dir) => dir,
+            Err(e) => {
+                warn!("无法下载或解压 crate: {} {}", crate_name, crate_version);
+                // 返回原始工作目录
+                if std::env::set_current_dir(&original_dir).is_err() {
+                    warn!("无法返回原始工作目录: {}", original_dir.display());
+                }
+                return None;
             }
-            return None;
-        }
-
-        let crate_dir = format!("{}-{}", crate_name, crate_version);
+        };
 
         // 进入crate目录
         if std::env::set_current_dir(&crate_dir).is_err() {
-            warn!("无法进入crate目录: {}", crate_dir);
+            warn!("无法进入crate目录: {}", crate_dir.display());
             // 返回原始工作目录
             if std::env::set_current_dir(&original_dir).is_err() {
                 warn!("无法返回原始工作目录: {}", original_dir.display());
@@ -398,7 +201,7 @@ impl DependencyAnalyzer {
                                     ))
                                     .await;
                                     let _ = Command::new("rm")
-                                        .args(&["-rf", &crate_dir])
+                                        .args(&["-rf", &crate_dir.to_string_lossy()])
                                         .output()
                                         .await;
 
@@ -409,7 +212,9 @@ impl DependencyAnalyzer {
 
                                     return Some(callers_content);
                                 }
+
                             }
+
                         }
                     } else {
                         warn!("无法读取callers.json文件: {}", callers_json_path.display());
@@ -428,7 +233,10 @@ impl DependencyAnalyzer {
 
             // 清理下载的压缩包和解压后的项目文件夹
             let _ = tokio_fs::remove_file(format!("{}-{}.crate", crate_name, crate_version)).await;
-            let _ = Command::new("rm").args(&["-rf", &crate_dir]).output().await;
+            let _ = Command::new("rm")
+                .args(&["-rf", &crate_dir.to_string_lossy()])
+                .output()
+                .await;
         }
 
         // 返回原始工作目录
@@ -520,7 +328,7 @@ impl DependencyAnalyzer {
         start_crate: &str,
         version_range: &str,
         target_function_path: &str,
-    ) -> Vec<DependencyNode> {
+    ) -> Result<Vec<DependencyNode>> {
         info!(
             "开始BFS查找所有依赖者: {} {} 目标函数: {}",
             start_crate, version_range, target_function_path
@@ -531,20 +339,15 @@ impl DependencyAnalyzer {
         let mut leaf_nodes = Vec::new();
 
         // 解析版本范围
-        let version_req = match VersionReq::parse(version_range) {
-            Ok(req) => req,
-            Err(e) => {
-                error!("解析版本范围失败: {}", e);
-                return Vec::new();
-            }
-        };
+        let version_req = VersionReq::parse(version_range)
+            .map_err(|e| anyhow::anyhow!("解析版本范围失败: {}", e))?;
 
         // 获取起始crate的所有版本
-        let versions = self.query_crate_versions(start_crate).await;
+        let versions = self.database.query_crate_versions(start_crate).await?;
+
         for version in versions {
             if let Ok(ver) = Version::parse(&version) {
                 if version_req.matches(&ver) {
-                    // 直接将匹配的版本加入队列
                     queue.push_back((start_crate.to_string(), version.clone()));
                 }
             }
@@ -555,7 +358,7 @@ impl DependencyAnalyzer {
             info!("处理 crate: {} version: {}", current_crate, current_version);
 
             // 查询当前crate-version的所有依赖者
-            let dependents = self.query_dependents(&current_crate).await;
+            let dependents = self.database.query_dependents(&current_crate).await?;
             let mut node = DependencyNode {
                 name: current_crate.clone(),
                 version: current_version.clone(),
@@ -617,6 +420,6 @@ impl DependencyAnalyzer {
             .await;
 
         info!("BFS遍历完成，找到 {} 个叶子节点", leaf_nodes.len());
-        leaf_nodes
+        Ok(leaf_nodes)
     }
 }
