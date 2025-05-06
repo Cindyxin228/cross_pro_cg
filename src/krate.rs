@@ -4,19 +4,36 @@ use tokio::fs as tokio_fs;
 use tokio::process::Command;
 use tracing::info;
 
-pub(crate) struct Krate {
+#[derive(Debug, Clone)]
+pub struct Krate {
     name: String,
     version: String,
-    dependencies: Vec<String>,
+    dependents: Vec<Krate>,
 }
 
 impl Krate {
-    pub(crate) fn new(name: String, version: String) -> Self {
+    pub fn new(name: String, version: String) -> Self {
         Self {
             name,
             version,
-            dependencies: Vec::new(),
+            dependents: Vec::new(),
         }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    pub fn dependents(&self) -> &Vec<Krate> {
+        &self.dependents
+    }
+
+    pub fn dependents_mut(&mut self) -> &mut Vec<Krate> {
+        &mut self.dependents
     }
 
     /// obtain the download directory
@@ -187,13 +204,18 @@ impl Krate {
 
     /// download and unzip the crate, return the path to the extracted directory
     pub async fn get_crate_dir_path(&self) -> Result<PathBuf> {
-        // first download
-        self.download().await?;
+        let extract_dir_path = self.get_extract_dir_path();
 
-        // then unzip
+        // 优先判断解压目录是否已存在
+        if extract_dir_path.exists() && extract_dir_path.is_dir() {
+            return Ok(extract_dir_path);
+        }
+
+        // 如果没有解压目录，才需要下载和解压
+        self.download().await?;
         let unzip_path = self.unzip().await?;
 
-        // check if the unzip_path is a directory
+        // 检查解压目录
         if !unzip_path.is_dir() || unzip_path.read_dir().is_err() {
             return Err(anyhow::anyhow!(
                 "the unzip path is not a directory: {}",

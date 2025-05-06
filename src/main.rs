@@ -22,22 +22,22 @@ async fn main() {
     tracing::info!("开始分析依赖关系");
     let analyzer = DependencyAnalyzer::new().await.unwrap();
 
-    // 分析 ring crate 的依赖关系
-    tracing::info!("分析 ring crate 的依赖关系");
-    let leaf_nodes = analyzer
-        .find_all_dependents(
+    // 分析 crossbeam-channel crate 的依赖关系
+    tracing::info!("分析 crossbeam-channel crate 的依赖关系");
+    let dependency_tree = analyzer
+        .build_dependency_tree(
             "crossbeam-channel",
             ">=0.5.11, <0.5.15",
             "crossbeam_channel::flavors::list::Channel::discard_all_messages",
         )
-        .await;
+        .await
+        .unwrap();
 
-    let leaf_nodes = leaf_nodes.unwrap();
     // 输出结果
-    tracing::info!("找到的叶子节点数量: {}", leaf_nodes.len());
-    tracing::info!("叶子节点列表:");
-    for node in leaf_nodes {
-        tracing::info!("  {}:{}", node.name, node.version);
+    tracing::info!("构建的依赖树根节点有 {} 个直接子节点", dependency_tree.dependents().len());
+    tracing::info!("依赖树结构:");
+    for child in dependency_tree.dependents() {
+        tracing::info!("  {}:{}", child.name(), child.version());
     }
 
     tracing::info!("分析完成");
