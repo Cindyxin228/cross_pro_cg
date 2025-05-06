@@ -73,7 +73,7 @@ impl DependencyAnalyzer {
 
         // 如果分析成功且有结果，保存到项目目录
         if let Some(callers_content) = &result {
-            if let Err(e) = self.save_analysis_result(crate_name, crate_version, callers_content).await {
+            if let Err(e) = self.save_analysis_result(crate_name, crate_version, &crate_dir).await {
                 warn!("保存分析结果失败: {}", e);
             }
         }
@@ -85,7 +85,7 @@ impl DependencyAnalyzer {
     async fn prepare_analysis_environment(
         &self,
         krate: &Krate,
-        original_dir: &PathBuf,
+        _original_dir: &PathBuf,
     ) -> Result<PathBuf> {
         info!("准备分析环境: {} {}", krate.name(), krate.version());
 
@@ -95,15 +95,7 @@ impl DependencyAnalyzer {
             krate.name(), krate.version()
         ))?;
 
-        // 进入crate目录
-        if std::env::set_current_dir(&crate_dir).is_err() {
-            return Err(anyhow::anyhow!(
-                "无法进入crate目录: {}",
-                crate_dir.display()
-            ));
-        }
-
-        info!("成功进入crate目录: {}", crate_dir.display());
+        info!("crate目录已就绪: {}", crate_dir.display());
         Ok(crate_dir)
     }
 
@@ -115,8 +107,19 @@ impl DependencyAnalyzer {
     ) -> Result<Option<String>> {
         info!("运行函数调用分析工具，目标函数: {}", function_path);
 
-        let call_cg_result = Command::new("call-cg4rs")
-            .args(&["--find-callers", function_path, "--json-output"])
+        let manifest_path = crate_dir.join("Cargo.toml");
+        let output_dir = crate_dir.join("target"); // 工具生成在 crate 目录下
+
+        let mut cmd = Command::new("call-cg4rs");
+        cmd.args(&[
+            "--find-callers", function_path,
+            "--json-output",
+            "--manifest-path", &manifest_path.to_string_lossy(),
+            "--output-dir", &output_dir.to_string_lossy(),
+        ]);
+        cmd.env("ROOT_PATH", &crate_dir);
+
+        let call_cg_result = cmd
             .output()
             .await
             .context("运行call-cg4rs工具失败")?;
@@ -127,30 +130,19 @@ impl DependencyAnalyzer {
             return Ok(None);
         }
 
-        // 检查target/callers.json文件是否存在
-        let callers_json_path = crate_dir.join("target").join("callers.json");
+        // 工具生成的 callers.json 路径
+        let callers_json_path = output_dir.join("callers.json");
         if !callers_json_path.exists() {
             info!("未找到callers.json文件，说明没有函数调用");
             return Ok(None);
         }
 
-        // 读取callers.json文件内容
+        // 读取callers.json内容
         let callers_content = tokio_fs::read_to_string(&callers_json_path)
             .await
             .context(format!("读取callers.json文件失败: {}", callers_json_path.display()))?;
 
-        // 解析JSON并检查total_callers
-        if let Ok(json) = serde_json::from_str::<Value>(&callers_content) {
-            if let Some(total_callers) = json.get("total_callers").and_then(|v| v.as_i64()) {
-                if total_callers > 0 {
-                    info!("发现 {} 个函数调用", total_callers);
-                    return Ok(Some(callers_content));
-                }
-            }
-        }
-
-        info!("未发现函数调用");
-        Ok(None)
+        Ok(Some(callers_content))
     }
 
     // 保存分析结果到项目目录
@@ -158,24 +150,25 @@ impl DependencyAnalyzer {
         &self,
         crate_name: &str,
         crate_version: &str,
-        callers_content: &str,
+        crate_dir: &PathBuf,
     ) -> Result<()> {
+        let src_path = crate_dir.join("target").join("callers.json");
         let result_filename = format!("{}-{}-callers.json", crate_name, crate_version);
-        let result_path = Path::new("target").join(&result_filename);
+        let dst_path = Path::new("target").join(&result_filename);
 
         // 确保 target 目录存在
-        if let Some(parent) = result_path.parent() {
+        if let Some(parent) = dst_path.parent() {
             tokio_fs::create_dir_all(parent)
                 .await
                 .context("创建target目录失败")?;
         }
 
-        // 写入结果文件
-        tokio_fs::write(&result_path, callers_content)
+        // 复制文件
+        tokio_fs::copy(&src_path, &dst_path)
             .await
-            .context(format!("写入结果文件失败: {}", result_path.display()))?;
+            .context(format!("复制callers.json到目标目录失败: {} -> {}", src_path.display(), dst_path.display()))?;
 
-        info!("已保存结果到: {}", result_path.display());
+        info!("已保存结果到: {}", dst_path.display());
         Ok(())
     }
 
@@ -184,21 +177,11 @@ impl DependencyAnalyzer {
         &self,
         krate: &Krate,
         _crate_dir: &PathBuf,
-        original_dir: &PathBuf,
+        _original_dir: &PathBuf,
         analysis_result: Result<Option<String>>,
     ) -> Option<String> {
-        // 返回上级目录
-        if std::env::set_current_dir("..").is_err() {
-            warn!("无法返回上级目录");
-        }
-
         // 只清理下载的 .crate 压缩包，不删除解压后的项目文件夹
         let _ = krate.cleanup_crate_file().await;
-
-        // 返回原始工作目录
-        if std::env::set_current_dir(original_dir).is_err() {
-            warn!("无法返回原始工作目录: {}", original_dir.display());
-        }
 
         match analysis_result {
             Ok(Some(result)) => {
