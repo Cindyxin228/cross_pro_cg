@@ -3,6 +3,15 @@ use std::path::{Path, PathBuf};
 use tokio::fs as tokio_fs;
 use tokio::process::Command;
 use tracing::info;
+use once_cell::sync::Lazy;
+use tokio::sync::Mutex;
+use std::collections::HashSet;
+use tokio::sync::Semaphore;
+use std::sync::Arc;
+
+// 下载/解压限流
+static DOWNLOAD_SEMAPHORE: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(128))); // 可调
+static GLOBAL_CRATE_LOCK: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
 
 #[derive(Debug, Clone)]
 pub struct Krate {
@@ -65,6 +74,10 @@ impl Krate {
         let crate_file_path = self.get_crate_file_path();
         let extract_dir_path = self.get_extract_dir_path();
 
+        tracing::info!("crate_file_path: {}", crate_file_path.display());
+        tracing::info!("extract_dir_path: {}", extract_dir_path.display());
+        tracing::info!("download_dir: {}", download_dir.display());
+
         // check if the crate-version.crate file already exists
         // we don't need to download the crate file again
         if crate_file_path.exists() {
@@ -126,6 +139,10 @@ impl Krate {
         let crate_file_path = self.get_crate_file_path();
         let extract_dir_path = self.get_extract_dir_path();
         let download_dir = self.get_download_dir();
+
+        tracing::info!("crate_file_path: {}", crate_file_path.display());
+        tracing::info!("extract_dir_path: {}", extract_dir_path.display());
+        tracing::info!("download_dir: {}", download_dir.display());
 
         // if the target directory already exists, return directly
         if extract_dir_path.exists() {
@@ -204,26 +221,77 @@ impl Krate {
 
     /// download and unzip the crate, return the path to the extracted directory
     pub async fn get_crate_dir_path(&self) -> Result<PathBuf> {
+        let _download_permit = DOWNLOAD_SEMAPHORE.acquire().await.unwrap();
+
         let extract_dir_path = self.get_extract_dir_path();
+        let key = format!("{}-{}", self.name, self.version);
+
+        tracing::info!("get_crate_dir_path: extract_dir_path={}", extract_dir_path.display());
 
         // 优先判断解压目录是否已存在
         if extract_dir_path.exists() && extract_dir_path.is_dir() {
+            tracing::info!("get_crate_dir_path: 解压目录已存在: {}", extract_dir_path.display());
             return Ok(extract_dir_path);
         }
 
-        // 如果没有解压目录，才需要下载和解压
-        self.download().await?;
-        let unzip_path = self.unzip().await?;
-
-        // 检查解压目录
-        if !unzip_path.is_dir() || unzip_path.read_dir().is_err() {
-            return Err(anyhow::anyhow!(
-                "the unzip path is not a directory: {}",
-                unzip_path.display()
-            ));
+        // 加全局锁，防止并发重复下载/解压
+        let need_process = acquire_crate_lock(&extract_dir_path, &key).await?;
+        if !need_process {
+            // 其它任务已处理好，直接返回
+            return Ok(extract_dir_path);
         }
 
-        Ok(unzip_path)
+        // 下面的代码只有第一个任务能执行
+        let result = async {
+            tracing::info!("get_crate_dir_path: 解压目录不存在，准备下载和解压");
+
+            if let Err(e) = self.download().await {
+                tracing::warn!(
+                    "get_crate_dir_path: download() 失败: {}，crate_file_path={}",
+                    e,
+                    self.get_crate_file_path().display()
+                );
+                return Err(anyhow::anyhow!("download() 失败: {}", e));
+            } else {
+                tracing::info!("get_crate_dir_path: download() 成功");
+            }
+
+            let unzip_path = match self.unzip().await {
+                Ok(path) => {
+                    tracing::info!("get_crate_dir_path: unzip() 成功，解压到: {}", path.display());
+                    path
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "get_crate_dir_path: unzip() 失败: {}，crate_file_path={}, extract_dir_path={}",
+                        e,
+                        self.get_crate_file_path().display(),
+                        extract_dir_path.display()
+                    );
+                    return Err(anyhow::anyhow!("unzip() 失败: {}", e));
+                }
+            };
+
+            // 检查解压目录
+            if !unzip_path.is_dir() || unzip_path.read_dir().is_err() {
+                tracing::warn!(
+                    "get_crate_dir_path: 解压目录不是有效目录: {}",
+                    unzip_path.display()
+                );
+                return Err(anyhow::anyhow!(
+                    "the unzip path is not a directory: {}",
+                    unzip_path.display()
+                ));
+            }
+
+            tracing::info!("get_crate_dir_path: 返回解压目录: {}", unzip_path.display());
+            Ok(unzip_path)
+        }.await;
+
+        // 处理完毕后移除锁
+        release_crate_lock(&key).await;
+
+        result
     }
 
     /// cleanup the downloaded crate file, keep the extracted directory
@@ -242,4 +310,141 @@ impl Krate {
 
         Ok(())
     }
+
+    /// 修改目标 crate 的 Cargo.toml，将父节点依赖锁定为指定版本
+    pub async fn patch_cargo_toml_with_parent(
+        crate_dir: &Path,
+        parent_name: &str,
+        parent_version: &str,
+    ) -> Result<()> {
+        tracing::info!(
+            "准备为 {} patch 父依赖 {} ={}",
+            crate_dir.display(), parent_name, parent_version
+        );
+        let result = patch_single_dependency(crate_dir, parent_name, parent_version).await;
+        match &result {
+            Ok(_) => tracing::info!(
+                "patch_cargo_toml_with_parent: {} 的父依赖 {} ={} 处理完成",
+                crate_dir.display(), parent_name, parent_version
+            ),
+            Err(e) => tracing::warn!(
+                "patch_cargo_toml_with_parent: {} 的父依赖 {} ={} 处理失败: {}",
+                crate_dir.display(), parent_name, parent_version, e
+            ),
+        }
+        result
+    }
+}
+
+/// 获取全局 crate-version 锁，若已在处理中则等待目录出现
+async fn acquire_crate_lock(extract_dir_path: &Path, key: &str) -> Result<bool> {
+    let mut set = GLOBAL_CRATE_LOCK.lock().await;
+    if set.contains(key) {
+        // 已有任务在处理，等待目录出现
+        drop(set);
+        for _ in 0..40 { // 最多等20秒
+            if extract_dir_path.exists() && extract_dir_path.is_dir() {
+                tracing::info!("acquire_crate_lock: 等待期间解压目录已出现: {}", extract_dir_path.display());
+                return Ok(false); // 不需要自己处理
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        tracing::warn!("acquire_crate_lock: 等待解压目录超时: {}", extract_dir_path.display());
+        return Err(anyhow::anyhow!("等待解压目录超时: {}", extract_dir_path.display()));
+    } else {
+        set.insert(key.to_string());
+        Ok(true) // 需要自己处理
+    }
+}
+
+/// 释放全局 crate-version 锁
+async fn release_crate_lock(key: &str) {
+    let mut set = GLOBAL_CRATE_LOCK.lock().await;
+    set.remove(key);
+}
+
+/// 修改 Cargo.toml，将 dep_name 的依赖版本锁定为 dep_version
+async fn patch_single_dependency(
+    crate_dir: &Path,
+    dep_name: &str,
+    dep_version: &str,
+) -> Result<()> {
+    let cargo_toml_path = crate_dir.join("Cargo.toml");
+    tracing::info!(
+        "准备修改 {} 的依赖 {} 为版本 ={}",
+        cargo_toml_path.display(),
+        dep_name,
+        dep_version
+    );
+
+    let content = tokio_fs::read_to_string(&cargo_toml_path)
+        .await
+        .context(format!("读取 Cargo.toml 失败: {}", cargo_toml_path.display()))?;
+
+    let new_content = patch_dependency_version_in_toml(&content, dep_name, dep_version)?;
+
+    if new_content != content {
+        tracing::info!(
+            "检测到 {} 依赖 {} 需要修改，准备写入新内容...",
+            cargo_toml_path.display(), dep_name
+        );
+        tokio_fs::write(&cargo_toml_path, &new_content)
+            .await
+            .context(format!("写入 Cargo.toml 失败: {}", cargo_toml_path.display()))?;
+        tracing::info!(
+            "已将 {} 的依赖 {} 锁定为版本 ={}",
+            cargo_toml_path.display(),
+            dep_name,
+            dep_version
+        );
+    } else {
+        tracing::info!(
+            "未在 {} 中找到依赖 {}，无需修改",
+            cargo_toml_path.display(),
+            dep_name
+        );
+    }
+
+    Ok(())
+}
+
+/// 修改 toml 内容，将 dep_name 的版本锁定为 =dep_version
+fn patch_dependency_version_in_toml(
+    toml_content: &str,
+    dep_name: &str,
+    dep_version: &str,
+) -> Result<String> {
+    let mut new_lines = Vec::new();
+    let mut in_dependencies = false;
+    let mut modified = false;
+
+    for line in toml_content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("[dependencies]") {
+            in_dependencies = true;
+            new_lines.push(line.to_string());
+            continue;
+        }
+        if trimmed.starts_with('[') && trimmed != "[dependencies]" {
+            in_dependencies = false;
+        }
+
+        if in_dependencies && trimmed.starts_with(&format!("{} ", dep_name))
+            || in_dependencies && trimmed.starts_with(&format!("{}=", dep_name))
+        {
+            // 处理形如 foo = "..." 或 foo = { ... }
+            let new_line = format!("{} = \"={}\"", dep_name, dep_version);
+            new_lines.push(new_line);
+            modified = true;
+            tracing::info!("patch_dependency_version_in_toml: 已修改依赖 {} 的版本为 ={}", dep_name, dep_version);
+        } else {
+            new_lines.push(line.to_string());
+        }
+    }
+
+    if !modified {
+        tracing::warn!("patch_dependency_version_in_toml: 未在 dependencies 中找到依赖 {}，未做修改", dep_name);
+    }
+
+    Ok(new_lines.join("\n"))
 }

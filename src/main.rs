@@ -6,6 +6,7 @@ mod logger;
 use dependency_analyzer::DependencyAnalyzer;
 use std::fs;
 use std::path::Path;
+use std::collections::VecDeque;
 
 #[tokio::main]
 async fn main() {
@@ -22,23 +23,21 @@ async fn main() {
     tracing::info!("开始分析依赖关系");
     let analyzer = DependencyAnalyzer::new().await.unwrap();
 
-    // 分析 crossbeam-channel crate 的依赖关系
-    tracing::info!("分析 crossbeam-channel crate 的依赖关系");
-    let dependency_tree = analyzer
-        .build_dependency_tree(
-            "crossbeam-channel",
-            ">=0.5.11, <0.5.15",
+    // 1. 解析版本范围，初始化根节点和 dependents
+    let version_req = analyzer.parse_version_requirement(">=0.5.11, <0.5.15").unwrap();
+    let mut root = analyzer.create_root_node();
+    let mut _tmp_queue = VecDeque::new();
+    analyzer.initialize_root_children(&mut root, "crossbeam-channel", &version_req, &mut _tmp_queue).await.unwrap();
+
+    // 2. 调用 BFS 分析
+    analyzer
+        .bfs_dependency_analysis(
+            &root,
             "crossbeam_channel::flavors::list::Channel::discard_all_messages",
+            32, // 并发数
         )
         .await
         .unwrap();
-
-    // 输出结果
-    tracing::info!("构建的依赖树根节点有 {} 个直接子节点", dependency_tree.dependents().len());
-    tracing::info!("依赖树结构:");
-    for child in dependency_tree.dependents() {
-        tracing::info!("  {}:{}", child.name(), child.version());
-    }
 
     tracing::info!("分析完成");
 }
