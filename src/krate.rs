@@ -247,13 +247,13 @@ impl Krate {
 
             if let Err(e) = self.download().await {
                 tracing::warn!(
-                    "get_crate_dir_path: download() 失败: {}，crate_file_path={}",
+                    "get_crate_dir_path: download()失败: {}，crate_file_path={}",
                     e,
                     self.get_crate_file_path().display()
                 );
-                return Err(anyhow::anyhow!("download() 失败: {}", e));
+                return Err(anyhow::anyhow!("download()失败: {}", e));
             } else {
-                tracing::info!("get_crate_dir_path: download() 成功");
+                tracing::info!("get_crate_dir_path: download()成功");
             }
 
             let unzip_path = match self.unzip().await {
@@ -398,11 +398,11 @@ async fn patch_single_dependency(
             dep_version
         );
     } else {
-        tracing::info!(
-            "未在 {} 中找到依赖 {}，无需修改",
-            cargo_toml_path.display(),
-            dep_name
-        );
+        // tracing::info!(
+        //     "未在 {} 中找到依赖 {}，无需修改",
+        //     cargo_toml_path.display(),
+        //     dep_name
+        // );
     }
 
     Ok(())
@@ -416,27 +416,44 @@ fn patch_dependency_version_in_toml(
 ) -> Result<String> {
     let mut new_lines = Vec::new();
     let mut in_dependencies = false;
+    let mut in_dep_table = false;
     let mut modified = false;
 
     for line in toml_content.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with("[dependencies]") {
+        // 进入 [dependencies] 块
+        if trimmed.starts_with("[dependencies]") && !trimmed.starts_with(&format!("[dependencies.{}]", dep_name)) {
             in_dependencies = true;
+            in_dep_table = false;
             new_lines.push(line.to_string());
             continue;
         }
-        if trimmed.starts_with('[') && trimmed != "[dependencies]" {
+        // 进入 [dependencies.foo] 子表
+        if trimmed == format!("[dependencies.{}]", dep_name) {
             in_dependencies = false;
+            in_dep_table = true;
+            new_lines.push(line.to_string());
+            continue;
+        }
+        // 进入其他表，退出依赖块
+        if trimmed.starts_with('[') && !trimmed.starts_with("[dependencies]") && !trimmed.starts_with(&format!("[dependencies.{}]", dep_name)) {
+            in_dependencies = false;
+            in_dep_table = false;
         }
 
-        if in_dependencies && trimmed.starts_with(&format!("{} ", dep_name))
-            || in_dependencies && trimmed.starts_with(&format!("{}=", dep_name))
-        {
-            // 处理形如 foo = "..." 或 foo = { ... }
+        // 普通依赖形式 foo = "..." 或 foo = { ... }
+        if in_dependencies && (trimmed.starts_with(&format!("{} ", dep_name)) || trimmed.starts_with(&format!("{}=", dep_name))) {
             let new_line = format!("{} = \"={}\"", dep_name, dep_version);
             new_lines.push(new_line);
             modified = true;
-            tracing::info!("patch_dependency_version_in_toml: 已修改依赖 {} 的版本为 ={}", dep_name, dep_version);
+            tracing::info!("patch_dependency_version_in_toml: 已修改依赖 {} 的版本为 ={} (普通依赖)", dep_name, dep_version);
+        }
+        // 子表形式 [dependencies.foo] 下的 version = "..."
+        else if in_dep_table && trimmed.starts_with("version") {
+            let new_line = format!("version = \"={}\"", dep_version);
+            new_lines.push(new_line);
+            modified = true;
+            tracing::info!("patch_dependency_version_in_toml: 已修改依赖 {} 的版本为 ={} ([dependencies.{}] 子表)", dep_name, dep_version, dep_name);
         } else {
             new_lines.push(line.to_string());
         }
