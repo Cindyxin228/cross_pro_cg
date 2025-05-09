@@ -220,156 +220,55 @@ impl DependencyAnalyzer {
         }
     }
 
-    // 主函数改名为更具体的名字
-    pub async fn build_dependency_tree(
-        &self,
-        start_crate: &str,
-        version_range: &str,
-        target_function_path: &str,
-    ) -> Result<Krate> {
-        info!(
-            "开始构建依赖树: {} {} 目标函数: {}",
-            start_crate, version_range, target_function_path
-        );
-
-        let version_req = self.parse_version_requirement(version_range)?;
-        let mut root = self.create_root_node();
-        let mut visited = HashSet::new();
-        let mut queue = VecDeque::new();
-
-        // 初始化根节点的直接子节点
-        self.initialize_root_children(&mut root, start_crate, &version_req, &mut queue).await?;
-        info!("已初始化根节点的直接子节点，共 {} 个", root.dependents().len());
-
-        // 并发BFS遍历构建依赖树
-        let max_concurrent = 32; // 可根据机器核数调整
-        self.build_tree_bfs_parallel(&mut root, &mut queue, &mut visited, target_function_path, max_concurrent).await?;
-
-        info!("依赖树构建完成，共访问了 {} 个节点", visited.len());
-        Ok(root)
-    }
-
     // 解析版本要求
     pub fn parse_version_requirement(&self, version_range: &str) -> Result<VersionReq> {
         VersionReq::parse(version_range)
             .map_err(|e| anyhow::anyhow!("解析版本范围失败: {}", e))
     }
 
-    // 创建根节点
-    pub fn create_root_node(&self) -> Krate {
-        Krate::new("root".to_string(), "0.0.0".to_string())
-    }
-
-    // 初始化根节点的直接子节点
-    pub async fn initialize_root_children(
+    /// 对指定 crate 的所有符合版本做统一 BFS 分析
+    pub async fn analyze_all_versions_bfs(
         &self,
-        root: &mut Krate,
-        start_crate: &str,
+        crate_name: &str,
         version_req: &VersionReq,
-        queue: &mut VecDeque<Krate>,
-    ) -> Result<()> {
-        let versions = self.database.query_crate_versions(start_crate).await?;
-        info!("获取到起始crate {} 的所有版本，共 {} 个", start_crate, versions.len());
-        
-        for version in versions {
-            if let Ok(ver) = Version::parse(&version) {
-                if version_req.matches(&ver) {
-                    info!("版本 {} 符合要求，添加到依赖树", version);
-                    let start_krate = Krate::new(start_crate.to_string(), version);
-                    root.dependents_mut().push(start_krate.clone());
-                    queue.push_back(start_krate);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// 并发BFS遍历依赖树
-    async fn build_tree_bfs_parallel(
-        &self,
-        root: &mut Krate,
-        queue: &mut VecDeque<Krate>,
-        visited: &mut HashSet<CrateVersion>,
         target_function_path: &str,
         max_concurrent: usize,
     ) -> Result<()> {
-        while !queue.is_empty() {
-            // 取出当前层所有节点
-            let mut current_level = Vec::new();
-            while let Some(node) = queue.pop_front() {
-                current_level.push(node);
-            }
-
-            // 并发分析当前层所有节点
-            let analyzer = Arc::new(self.clone());
-            let results = stream::iter(current_level)
-                .map(|current_krate| {
-                    let analyzer = Arc::clone(&analyzer);
-                    let target_function_path = target_function_path.to_string();
-                    async move {
-                        analyzer.process_dependents_parallel(
-                            current_krate,
-                            target_function_path,
-                        ).await
-                    }
-                })
-                .buffer_unordered(max_concurrent)
-                .collect::<Vec<_>>()
-                .await;
-
-            // 把新发现的节点加入队列
-            for result in results {
-                if let Ok(new_nodes) = result {
-                    for new_node in new_nodes {
-                        let cv = CrateVersion {
-                            name: new_node.name().to_string(),
-                            version: new_node.version().to_string(),
-                        };
-                        if visited.insert(cv) {
-                            queue.push_back(new_node);
-                        }
+        let versions = self.database.query_crate_versions(crate_name).await?;
+        tracing::info!("开始分析 crate: {}，版本范围: {}，共 {} 个版本", crate_name, version_req, versions.len());
+        let mut bfs_queue = VecDeque::new();
+        for version in versions {
+            if version_req.matches(&Version::parse(&version)?) {
+                tracing::info!("处理给定 crate {} {} 的 dependents", crate_name, version);
+                let dependents = self.database.query_dependents(crate_name).await?;
+                for (dep_name, dep_version, req) in dependents.iter() {
+                    // patch
+                    let dep_krate = Krate::new(dep_name.clone(), dep_version.clone());
+                    let dep_dir = dep_krate.get_crate_dir_path().await?;
+                    Krate::patch_cargo_toml_with_parent(&dep_dir, crate_name, &version).await?;
+                    // 判断是否调用目标函数
+                    if self.is_valid_dependent(
+                        &version,
+                        req,
+                        dep_name,
+                        dep_version,
+                        target_function_path,
+                    ).await.unwrap_or(false) {
+                        tracing::info!("依赖者 {} {} 满足条件，加入BFS队列", dep_name, dep_version);
+                        bfs_queue.push_back(BfsNode {
+                            krate: dep_krate,
+                            parent: Some((crate_name.to_string(), version.clone())),
+                        });
+                    } else {
+                        tracing::info!("依赖者 {} {} 不满足条件，跳过", dep_name, dep_version);
                     }
                 }
             }
         }
+        tracing::info!("所有给定 crate 版本的 dependents 处理完毕，BFS队列长度:{}", bfs_queue.len());
+        self.bfs_from_queue(bfs_queue, target_function_path, max_concurrent).await?;
+        tracing::info!("analyze_all_versions_bfs: 所有版本分析完成");
         Ok(())
-    }
-
-    /// 并发处理 dependents
-    async fn process_dependents_parallel(
-        &self,
-        current_krate: Krate,
-        target_function_path: String,
-    ) -> Result<Vec<Krate>> {
-        let dependents = self.database.query_dependents(&current_krate.name()).await?;
-        let mut new_nodes = Vec::new();
-
-        let futures = dependents.into_iter().map(|(dep_name, dep_version, req)| {
-            let analyzer = self.clone();
-            let current_version = current_krate.version().to_string();
-            let target_function_path = target_function_path.clone();
-            async move {
-                let _permit = GLOBAL_ANALYSIS_SEMAPHORE.acquire().await.unwrap();
-
-                if analyzer.is_valid_dependent(
-                    &current_version,
-                    &req,
-                    &dep_name,
-                    &dep_version,
-                    &target_function_path,
-                ).await.unwrap_or(false) {
-                    Some(Krate::new(dep_name, dep_version))
-                } else {
-                    None
-                }
-            }
-        });
-
-        let results = futures::future::join_all(futures).await;
-        for node in results.into_iter().flatten() {
-            new_nodes.push(node);
-        }
-        Ok(new_nodes)
     }
 
     // 检查依赖者是否有效（版本匹配且调用了目标函数）
@@ -403,41 +302,6 @@ impl DependencyAnalyzer {
         Ok(false)
     }
 
-    pub async fn bfs_dependency_analysis(
-        &self,
-        root: &Krate,
-        target_function_path: &str,
-        max_concurrent: usize,
-    ) -> Result<()> {
-        tracing::info!("BFS分析启动，目标函数: {}，最大并发: {}", target_function_path, max_concurrent);
-        let mut queue = self.init_bfs_queue(root).await?;
-        let mut visited = HashSet::new();
-        let mut level = 0;
-
-        while !queue.is_empty() {
-            level += 1;
-            tracing::info!("========== 开始BFS第{}层，队列长度:{} ==========", level, queue.len());
-            let current_level = self.pop_bfs_level(&mut queue);
-            let results = self.process_bfs_level(current_level, target_function_path, max_concurrent, &mut visited).await?;
-            self.push_next_level(&mut queue, results, &mut visited);
-            tracing::info!("========== 结束BFS第{}层，剩余队列:{} ==========", level, queue.len());
-        }
-        tracing::info!("BFS分析完成，总共访问了 {} 个节点", visited.len());
-        Ok(())
-    }
-
-    async fn init_bfs_queue(&self, root: &Krate) -> Result<VecDeque<BfsNode>> {
-        let mut queue = VecDeque::new();
-        for child in root.dependents() {
-            queue.push_back(BfsNode {
-                krate: child.clone(),
-                parent: None,
-            });
-        }
-        tracing::info!("BFS初始化队列，根节点有 {} 个直接子节点", queue.len());
-        Ok(queue)
-    }
-
     fn pop_bfs_level(&self, queue: &mut VecDeque<BfsNode>) -> Vec<BfsNode> {
         let mut current_level = Vec::new();
         while let Some(node) = queue.pop_front() {
@@ -454,6 +318,7 @@ impl DependencyAnalyzer {
         max_concurrent: usize,
         visited: &mut HashSet<CrateVersion>,
     ) -> Result<Vec<BfsNode>> {
+        tracing::info!("process_bfs_level: 本层节点数:{}，最大并发:{}", current_level.len(), max_concurrent);
         let analyzer = Arc::new(self.clone());
         let results = stream::iter(current_level)
             .map(|bfs_node| {
@@ -467,10 +332,11 @@ impl DependencyAnalyzer {
             .collect::<Vec<_>>()
             .await;
 
-        // 收集所有下一层节点acquire().await
         let mut next_nodes = Vec::new();
+        let mut total_new = 0;
         for result in results {
             if let Ok(nodes) = result {
+                total_new += nodes.len();
                 for node in nodes {
                     let cv = CrateVersion {
                         name: node.krate.name().to_string(),
@@ -482,6 +348,7 @@ impl DependencyAnalyzer {
                 }
             }
         }
+        tracing::info!("process_bfs_level: 本层发现新节点:{}", total_new);
         Ok(next_nodes)
     }
 
@@ -497,17 +364,13 @@ impl DependencyAnalyzer {
             bfs_node.parent
         );
 
-        // 1. 获取 crate 解压目录
         let crate_dir = bfs_node.krate.get_crate_dir_path().await?;
         tracing::info!("节点 {} {} 解压目录: {}", bfs_node.krate.name(), bfs_node.krate.version(), crate_dir.display());
-
-        // 2. patch Cargo.toml
         if let Some((ref parent_name, ref parent_version)) = bfs_node.parent {
             tracing::info!("为节点 {} {} patch 父依赖 {} ={}", bfs_node.krate.name(), bfs_node.krate.version(), parent_name, parent_version);
             Krate::patch_cargo_toml_with_parent(&crate_dir, parent_name, parent_version).await?;
         }
 
-        // 3. 分析
         tracing::info!("分析节点 {} {} 是否调用目标函数", bfs_node.krate.name(), bfs_node.krate.version());
         self.analyze_function_calls(
             &bfs_node.krate.name(),
@@ -515,7 +378,6 @@ impl DependencyAnalyzer {
             target_function_path,
         ).await;
 
-        // 4. 查询 dependents，筛选有效的依赖者
         let dependents = self.database.query_dependents(&bfs_node.krate.name()).await?;
         tracing::info!("节点 {} {} 有 {} 个直接依赖者", bfs_node.krate.name(), bfs_node.krate.version(), dependents.len());
         let mut next_nodes = Vec::new();
@@ -529,7 +391,7 @@ impl DependencyAnalyzer {
             ).await.unwrap_or(false) {
                 tracing::info!("依赖者 {} {} 满足条件，加入下一层", dep_name, dep_version);
                 next_nodes.push(BfsNode {
-                    krate: Krate::new(dep_name, dep_version),
+                    krate: Krate::new(dep_name.clone(), dep_version.clone()),
                     parent: Some((bfs_node.krate.name().to_string(), bfs_node.krate.version().to_string())),
                 });
             } else {
@@ -550,5 +412,28 @@ impl DependencyAnalyzer {
             queue.push_back(node);
         }
         tracing::info!("BFS推入下一层，共 {} 个节点", count);
+    }
+
+    async fn bfs_from_queue(
+        &self,
+        mut queue: VecDeque<BfsNode>,
+        target_function_path: &str,
+        max_concurrent: usize,
+    ) -> Result<()> {
+        let mut visited = HashSet::new();
+        let mut level = 0;
+        while !queue.is_empty() {
+            level += 1;
+            tracing::info!("BFS第{}层，队列长度:{}", level, queue.len());
+            let current_level = self.pop_bfs_level(&mut queue);
+            let results = self.process_bfs_level(
+                current_level,
+                target_function_path,
+                max_concurrent,
+                &mut visited,
+            ).await?;
+            self.push_next_level(&mut queue, results, &mut visited);
+        }
+        Ok(())
     }
 }
