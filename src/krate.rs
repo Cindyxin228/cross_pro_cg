@@ -334,6 +334,28 @@ impl Krate {
         }
         result
     }
+
+    /// 在 crate 解压目录下执行 cargo clean，释放 target 空间
+    pub async fn cargo_clean(&self) -> Result<()> {
+        let extract_dir = self.get_extract_dir_path();
+        let manifest_path = extract_dir.join("Cargo.toml");
+        if !manifest_path.exists() {
+            tracing::warn!("cargo_clean: {} 不存在，跳过", manifest_path.display());
+            return Ok(());
+        }
+        tracing::info!("cargo_clean: {}", manifest_path.display());
+        let output = Command::new("cargo")
+            .args(&["clean", "--manifest-path", &manifest_path.to_string_lossy()])
+            .current_dir(&extract_dir)
+            .output()
+            .await
+            .context(format!("执行 cargo clean 失败: {}", manifest_path.display()))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::warn!("cargo clean 执行失败: {}", stderr);
+        }
+        Ok(())
+    }
 }
 
 /// 获取全局 crate-version 锁，若已在处理中则等待目录出现
