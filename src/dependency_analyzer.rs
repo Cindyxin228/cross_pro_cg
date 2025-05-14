@@ -15,7 +15,7 @@ use crate::database::Database;
 use crate::krate::Krate;
 
 // 在文件顶部添加常量定义
-const MAX_CONCURRENT_TASKS: usize = 16;
+const MAX_CONCURRENT_TASKS: usize = 6;
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct CrateVersion {
@@ -171,7 +171,13 @@ impl DependencyAnalyzer {
             krate.name(),
             krate.version()
         );
+        let precise_version = &krate.version();
         let dependents = self.database.query_dependents(&krate.name()).await?;
+        let filtered_dependents = Self::filter_dependents_by_version_req(dependents, precise_version);
+        tracing::info!(
+            "filtered_dependents共得到符合版本要求的crate共 {} 个",
+            filtered_dependents.len()
+        );
         let krate = Arc::new(krate); // 用 Arc 包裹
         tracing::info!(
             "query_dependents 返回 for {} {}",
@@ -179,7 +185,7 @@ impl DependencyAnalyzer {
             krate.version()
         );
 
-        let next_nodes = stream::iter(dependents)
+        let next_nodes = stream::iter(filtered_dependents)
             .map(|(dep_name, dep_version, req)| {
                 let analyzer = self.clone();
                 let target_function_path = target_function_path.to_string();
@@ -193,7 +199,7 @@ impl DependencyAnalyzer {
                     };
 
                     // patch 之前保存原始内容
-                    let original_toml = match Krate::patch_cargo_toml_with_parent(
+                    let _original_toml = match Krate::patch_cargo_toml_with_parent(
                         &dep_dir,
                         &krate.name(),
                         &krate.version(),
@@ -203,6 +209,10 @@ impl DependencyAnalyzer {
                         Ok(content) => content,
                         Err(_) => return None,
                     };
+
+                    // 分析结束后删除 Cargo.lock
+                    let cargo_lock_path = dep_dir.join("Cargo.lock");
+                    let _ = tokio_fs::remove_file(&cargo_lock_path).await;
 
                     // 判断 valid
                     let is_valid = analyzer
@@ -215,12 +225,6 @@ impl DependencyAnalyzer {
                         )
                         .await
                         .unwrap_or(false);
-
-                    // 恢复 Cargo.toml
-                    if let Some(orig) = original_toml {
-                        let cargo_toml_path = dep_dir.join("Cargo.toml");
-                        let _ = tokio_fs::write(&cargo_toml_path, orig).await;
-                    }
 
                     if is_valid {
                         tracing::info!("依赖者 {} {} 满足条件，加入下一层", dep_name, dep_version);
@@ -240,6 +244,23 @@ impl DependencyAnalyzer {
         Ok(next_nodes)
     }
 
+    /// 根据依赖表达式筛选能匹配precise_version的依赖者
+    fn filter_dependents_by_version_req(
+        dependents: Vec<(String, String, String)>,
+        precise_version: &str,
+    ) -> Vec<(String, String, String)> {
+        let precise_version_parsed = semver::Version::parse(precise_version).ok();
+        dependents
+            .into_iter()
+            .filter(|(_dep_name, _dep_version, req)| {
+                if let (Some(ver), Ok(dep_req)) = (precise_version_parsed.as_ref(), semver::VersionReq::parse(req)) {
+                    dep_req.matches(ver)
+                } else {
+                    false
+                }
+            })
+            .collect()
+    }
 
     fn get_original_dir(&self) -> PathBuf {
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
