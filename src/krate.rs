@@ -1,20 +1,17 @@
 use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs as tokio_fs;
 use tokio::process::Command;
-use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tracing::info;
 
-const MAX_DOWNLOAD_CONCURRENT: usize = 32; // 与 DependencyAnalyzer 保持一致
+const MAX_DOWNLOAD_CONCURRENT: usize = 36; // 与 DependencyAnalyzer 保持一致
 
 // 下载/解压限流
 static DOWNLOAD_SEMAPHORE: Lazy<Arc<Semaphore>> =
     Lazy::new(|| Arc::new(Semaphore::new(MAX_DOWNLOAD_CONCURRENT)));
-static GLOBAL_CRATE_LOCK: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
 
 #[derive(Debug, Clone)]
 pub struct Krate {
@@ -243,13 +240,6 @@ impl Krate {
             return Ok(extract_dir_path);
         }
 
-        // 加全局锁，防止并发重复下载/解压
-        let need_process = acquire_crate_lock(&extract_dir_path, &key).await?;
-        if !need_process {
-            // 其它任务已处理好，直接返回
-            return Ok(extract_dir_path);
-        }
-
         // 下面的代码只有第一个任务能执行
         let result = async {
             tracing::info!("get_crate_dir_path: 解压目录不存在，准备下载和解压");
@@ -297,9 +287,6 @@ impl Krate {
             Ok(unzip_path)
         }.await;
 
-        // 处理完毕后移除锁
-        release_crate_lock(&key).await;
-
         result
     }
 
@@ -328,24 +315,29 @@ impl Krate {
     ) -> Result<Option<String>> {
         let cargo_toml_path = crate_dir.join("Cargo.toml");
         let original_content = tokio_fs::read_to_string(&cargo_toml_path).await.ok();
-
-        let result = patch_single_dependency(crate_dir, parent_name, parent_version).await;
-        match &result {
-            Ok(_) => tracing::info!(
-                "patch_cargo_toml_with_parent: {} 的父依赖 {} ={} 处理完成",
-                crate_dir.display(),
-                parent_name,
-                parent_version
-            ),
-            Err(e) => tracing::warn!(
-                "patch_cargo_toml_with_parent: {} 的父依赖 {} ={} 处理失败: {}",
-                crate_dir.display(),
-                parent_name,
+        // 使用cargo update --precise
+        let status = Command::new("cargo")
+            .args(&[
+                "update",
+                "--precise",
                 parent_version,
-                e
-            ),
+                "--package",
+                parent_name,
+                "--manifest-path",
+                &cargo_toml_path.to_string_lossy(),
+            ])
+            .current_dir(crate_dir)
+            .output()
+            .await
+            .context("执行 cargo update --precise 失败")?;
+        if !status.status.success() {
+            let stderr = String::from_utf8_lossy(&status.stderr);
+            tracing::warn!("cargo update --precise 执行失败: {}", stderr);
+            return Err(anyhow::anyhow!("cargo update --precise 执行失败: {}", stderr));
+        }else{
+            tracing::info!("cargo update --precise 执行成功");
         }
-        result.map(|_| original_content)
+        Ok(original_content)
     }
 
     /// 在 crate 解压目录下执行 cargo clean，释放 target 空间
@@ -372,166 +364,4 @@ impl Krate {
         }
         Ok(())
     }
-}
-
-/// 获取全局 crate-version 锁，若已在处理中则等待目录出现
-async fn acquire_crate_lock(extract_dir_path: &Path, key: &str) -> Result<bool> {
-    let mut set = GLOBAL_CRATE_LOCK.lock().await;
-    if set.contains(key) {
-        // 已有任务在处理，等待目录出现
-        drop(set);
-        for _ in 0..40 {
-            // 最多等20秒
-            if extract_dir_path.exists() && extract_dir_path.is_dir() {
-                tracing::info!(
-                    "acquire_crate_lock: 等待期间解压目录已出现: {}",
-                    extract_dir_path.display()
-                );
-                return Ok(false); // 不需要自己处理
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        }
-        tracing::warn!(
-            "acquire_crate_lock: 等待解压目录超时: {}",
-            extract_dir_path.display()
-        );
-        return Err(anyhow::anyhow!(
-            "等待解压目录超时: {}",
-            extract_dir_path.display()
-        ));
-    } else {
-        set.insert(key.to_string());
-        Ok(true) // 需要自己处理
-    }
-}
-
-/// 释放全局 crate-version 锁
-async fn release_crate_lock(key: &str) {
-    let mut set = GLOBAL_CRATE_LOCK.lock().await;
-    set.remove(key);
-}
-
-/// 修改 Cargo.toml，将 dep_name 的依赖版本锁定为 dep_version
-async fn patch_single_dependency(
-    crate_dir: &Path,
-    dep_name: &str,
-    dep_version: &str,
-) -> Result<()> {
-    let cargo_toml_path = crate_dir.join("Cargo.toml");
-    tracing::info!(
-        "准备修改 {} 的依赖 {} 为版本 ={}",
-        cargo_toml_path.display(),
-        dep_name,
-        dep_version
-    );
-
-    let content = tokio_fs::read_to_string(&cargo_toml_path)
-        .await
-        .context(format!(
-            "读取 Cargo.toml 失败: {}",
-            cargo_toml_path.display()
-        ))?;
-
-    let new_content = patch_dependency_version_in_toml(&content, dep_name, dep_version)?;
-
-    if new_content != content {
-        tracing::info!(
-            "检测到 {} 依赖 {} 需要修改，准备写入新内容...",
-            cargo_toml_path.display(),
-            dep_name
-        );
-        tokio_fs::write(&cargo_toml_path, &new_content)
-            .await
-            .context(format!(
-                "写入 Cargo.toml 失败: {}",
-                cargo_toml_path.display()
-            ))?;
-        tracing::info!(
-            "已将 {} 的依赖 {} 锁定为版本 ={}",
-            cargo_toml_path.display(),
-            dep_name,
-            dep_version
-        );
-    } else {
-        // tracing::info!(
-        //     "未在 {} 中找到依赖 {}，无需修改",
-        //     cargo_toml_path.display(),
-        //     dep_name
-        // );
-    }
-
-    Ok(())
-}
-
-/// 修改 toml 内容，将 dep_name 的版本锁定为 =dep_version
-fn patch_dependency_version_in_toml(
-    toml_content: &str,
-    dep_name: &str,
-    dep_version: &str,
-) -> Result<String> {
-    let mut new_lines = Vec::new();
-    let mut in_dependencies = false;
-    let mut in_dep_table = false;
-    let mut modified = false;
-
-    for line in toml_content.lines() {
-        let trimmed = line.trim();
-        // 进入 [dependencies] 块
-        if trimmed.starts_with("[dependencies]")
-            && !trimmed.starts_with(&format!("[dependencies.{}]", dep_name))
-        {
-            in_dependencies = true;
-            in_dep_table = false;
-            new_lines.push(line.to_string());
-            continue;
-        }
-        // 进入 [dependencies.foo] 子表
-        if trimmed == format!("[dependencies.{}]", dep_name) {
-            in_dependencies = false;
-            in_dep_table = true;
-            new_lines.push(line.to_string());
-            continue;
-        }
-        // 进入其他表，退出依赖块
-        if trimmed.starts_with('[')
-            && !trimmed.starts_with("[dependencies]")
-            && !trimmed.starts_with(&format!("[dependencies.{}]", dep_name))
-        {
-            in_dependencies = false;
-            in_dep_table = false;
-        }
-
-        // 普通依赖形式 foo = "..." 或 foo = { ... }
-        if in_dependencies
-            && (trimmed.starts_with(&format!("{} ", dep_name))
-                || trimmed.starts_with(&format!("{}=", dep_name)))
-        {
-            let new_line = format!("{} = \"={}\"", dep_name, dep_version);
-            new_lines.push(new_line);
-            modified = true;
-            tracing::info!(
-                "patch_dependency_version_in_toml: 已修改依赖 {} 的版本为 ={} (普通依赖)",
-                dep_name,
-                dep_version
-            );
-        }
-        // 子表形式 [dependencies.foo] 下的 version = "..."
-        else if in_dep_table && trimmed.starts_with("version") {
-            let new_line = format!("version = \"={}\"", dep_version);
-            new_lines.push(new_line);
-            modified = true;
-            tracing::info!("patch_dependency_version_in_toml: 已修改依赖 {} 的版本为 ={} ([dependencies.{}] 子表)", dep_name, dep_version, dep_name);
-        } else {
-            new_lines.push(line.to_string());
-        }
-    }
-
-    if !modified {
-        tracing::warn!(
-            "patch_dependency_version_in_toml: 未在 dependencies 中找到依赖 {}，未做修改",
-            dep_name
-        );
-    }
-
-    Ok(new_lines.join("\n"))
 }
