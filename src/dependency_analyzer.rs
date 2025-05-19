@@ -17,7 +17,6 @@ use crate::model::{Krate, ReverseDependency};
 
 // 在文件顶部添加常量定义
 const MAX_CONCURRENT_TASKS: usize = 6;
-const PATCH_RETRY: usize = 3;
 const BATCH_SIZE: usize = 100;
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -41,6 +40,40 @@ impl DependencyAnalyzer {
         })
     }
 
+    /// 从给定的版本列表中选择最老和最新的版本
+    fn select_oldest_and_newest_versions<T>(
+        &self,
+        mut versions: Vec<(Version, T)>,
+    ) -> Vec<T> 
+    where
+        T: Clone
+    {
+        if versions.is_empty() {
+            return Vec::new();
+        }
+        
+        // 按版本排序
+        versions.sort_by(|(v1, _), (v2, _)| v1.cmp(v2));
+
+        let mut result = Vec::new();
+        
+        // 添加最老的版本
+        if let Some((_, oldest)) = versions.first() {
+            result.push(oldest.clone());
+        }
+        
+        // 如果有多个版本且最新版本不同于最老版本，添加最新版本
+        if versions.len() > 1 {
+            if let Some((newest_ver, newest)) = versions.last() {
+                if newest_ver != &versions.first().unwrap().0 {
+                    result.push(newest.clone());
+                }
+            }
+        }
+        
+        result
+    }
+
     pub async fn analyze(
         &self,
         crate_name: &str,
@@ -57,14 +90,41 @@ impl DependencyAnalyzer {
             versions.len()
         );
 
-        // filter the versions with CVE existing
-        let bfs_queue = versions
+        // 筛选符合版本要求的版本
+        let matching_versions = versions
             .into_iter()
             .filter_map(|version| {
-                version_req
-                    .matches(&Version::parse(&version).ok()?)
-                    .then_some(Krate::new(&crate_name, &version))
+                let parsed_version = Version::parse(&version).ok()?;
+                version_req.matches(&parsed_version).then_some((parsed_version, version))
             })
+            .collect::<Vec<_>>();
+        
+        tracing::info!("找到符合版本要求的版本数: {}", matching_versions.len());
+        
+        // 只取最老和最新的版本（排序已在方法内部完成）
+        let selected_version_strings = self.select_oldest_and_newest_versions(matching_versions);
+        
+        if selected_version_strings.is_empty() {
+            tracing::info!("没有找到符合版本要求的版本");
+            return Ok(());
+        }
+        
+        for (i, version) in selected_version_strings.iter().enumerate() {
+            let is_oldest = i == 0;
+            let is_newest = i == selected_version_strings.len() - 1;
+            let version_type = if is_oldest && is_newest {
+                "唯一版本"
+            } else if is_oldest {
+                "最老版本"
+            } else {
+                "最新版本"
+            };
+            tracing::info!("选择{}: {}", version_type, version);
+        }
+        
+        let bfs_queue = selected_version_strings
+            .into_iter()
+            .map(|version| Krate::new(crate_name, &version))
             .collect::<VecDeque<_>>();
 
         self.bfs_from_queue(bfs_queue, function_path).await?;
@@ -182,12 +242,57 @@ impl DependencyAnalyzer {
             krate.version()
         );
 
+        // 对每个crate名称的不同版本只选择最老和最新的
+        let mut dependents_by_name: std::collections::HashMap<String, Vec<(Version, ReverseDependency)>> = 
+            std::collections::HashMap::new();
+        
+        // 按crate名称分组并解析版本
+        for dep in reverse_dependencies_for_certain_version {
+            if let Ok(version) = Version::parse(&dep.version) {
+                dependents_by_name
+                    .entry(dep.name.clone())
+                    .or_insert_with(Vec::new)
+                    .push((version, dep));
+            }
+        }
+        
+        // 对每个crate名称，按版本排序并只选最老和最新版本
+        let mut selected_dependents = Vec::new();
+        let mut total_crates = 0;
+        let mut total_versions = 0;
+        
+        for (name, versions) in dependents_by_name {
+            total_crates += 1;
+            let versions_count = versions.len();
+            total_versions += versions_count;
+            
+            // 选择最老和最新版本（排序已在方法内部完成）
+            let selected = self.select_oldest_and_newest_versions(versions);
+            let selected_count = selected.len();
+            
+            tracing::info!(
+                "依赖者 {} 有{}个版本，选择了{}个版本进行分析", 
+                name, 
+                versions_count, 
+                selected_count
+            );
+            
+            selected_dependents.extend(selected);
+        }
+        
+        let selected_dependents_count = selected_dependents.len();
+        tracing::info!(
+            "共有{}个crate依赖，筛选后剩余{}个版本进行分析",
+            total_crates,
+            selected_dependents_count
+        );
+
         let mut next_nodes = Vec::new();
 
-        for (batch_idx, batch) in reverse_dependencies_for_certain_version.chunks(BATCH_SIZE).enumerate() {
+        for (batch_idx, batch) in selected_dependents.chunks(BATCH_SIZE).enumerate() {
             tracing::info!("开始处理第{}批, 本批{}个依赖者", batch_idx + 1, batch.len());
             let batch_vec = batch.to_vec();
-            let reverse_dependencies_len = reverse_dependencies_for_certain_version.len();
+            let selected_dependents_len = selected_dependents.len();
             let batch_results = stream::iter(batch_vec.into_iter().enumerate())
                 .map(|(idx, reverse_dependency)| {
                     let reverse_name = reverse_dependency.name.clone();
@@ -198,7 +303,7 @@ impl DependencyAnalyzer {
                     let target_function_path = target_function_path.to_string();
                     let krate = Arc::clone(&krate);
                     
-                    tracing::info!("[依赖者进度 {}/{}] 正在分析依赖者: {} {}", idx + 1, reverse_dependencies_len, reverse_name, reverse_version);
+                    tracing::info!("[依赖者进度 {}/{}] 正在分析依赖者: {} {}", idx + 1, selected_dependents_len, reverse_name, reverse_version);
                     async move {
                         let _permit = analyzer.semaphore.acquire().await.unwrap();
                         let dep_krate = Krate::new(&reverse_name, &reverse_version);
@@ -257,9 +362,6 @@ impl DependencyAnalyzer {
                             tracing::info!("依赖者 {} {} 不满足条件，跳过", reverse_name, reverse_version);
                             None
                         }
-
-                        
-                        
                     }
                 })
                 .buffer_unordered(MAX_CONCURRENT_TASKS)
@@ -344,7 +446,7 @@ impl DependencyAnalyzer {
             .await;
 
         // 如果分析成功且有结果，保存到项目目录
-        if let Some(callers_content) = &result {
+        if let Some(_) = &result {
             if let Err(e) = self
                 .save_analysis_result(crate_name, crate_version, &crate_dir)
                 .await
