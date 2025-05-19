@@ -1,8 +1,11 @@
-use anyhow::{Context, Result};
-use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use std::env;
 use std::time::Duration;
-use tracing::{error, info};
+
+use anyhow::{Context, Result};
+use sqlx::{postgres::PgPoolOptions, PgPool, Row};
+use tracing::info;
+
+use crate::model::ReverseDependency;
 
 #[derive(Debug, Clone)]
 pub struct Database {
@@ -57,10 +60,7 @@ impl Database {
     }
 
     // 查询依赖某个crate的所有crates
-    pub async fn query_dependents(
-        &self,
-        crate_name: &str,
-    ) -> Result<Vec<(String, String, String)>> {
+    pub async fn query_dependents(&self, crate_name: &str) -> Result<Vec<ReverseDependency>> {
         info!("查询依赖 {} 的所有crates", crate_name);
 
         let query = "WITH target_crate AS (
@@ -83,7 +83,7 @@ impl Database {
         let dependents = rows
             .iter()
             .map(|row| {
-                (
+                ReverseDependency::new(
                     row.get::<String, _>("name"),
                     row.get::<String, _>("num"),
                     row.get::<String, _>("req"),
