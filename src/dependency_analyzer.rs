@@ -2,34 +2,33 @@ use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures::{stream, StreamExt};
 use semver::{Version, VersionReq};
-use serde_json::Value;
 use tokio::fs as tokio_fs;
 use tokio::process::Command;
+use tokio::time::{timeout, Duration};
 use tracing::{info, warn};
 
 use crate::database::Database;
-use crate::krate::Krate;
+use crate::model::{Krate, ReverseDependency};
+
+// 在文件顶部添加常量定义
+const MAX_CONCURRENT_TASKS: usize = 6;
+const BATCH_SIZE: usize = 100;
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
-pub struct CrateVersion {
+pub struct VisitedCrateVersion {
     pub name: String,
     pub version: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct DependencyNode {
-    pub name: String,
-    pub version: String,
-    pub dependents: Vec<(String, String, String)>, // (dependent_name, dependent_version, version_req)
 }
 
 #[derive(Debug, Clone)]
 pub struct DependencyAnalyzer {
     database: Arc<Database>,
+    semaphore: Arc<Semaphore>,
 }
 
 impl DependencyAnalyzer {
@@ -37,389 +36,635 @@ impl DependencyAnalyzer {
         let database = Database::new().await?;
         Ok(Self {
             database: Arc::new(database),
+            semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_TASKS)),
         })
     }
 
-    // 检查crate是否调用了指定的函数，并返回callers.txt的内容
-    async fn check_function_call(
+    /// 从给定的版本列表中选择最老和最新的版本
+    fn select_oldest_and_newest_versions<T>(
+        &self,
+        mut versions: Vec<(Version, T)>,
+    ) -> Vec<T> 
+    where
+        T: Clone
+    {
+        if versions.is_empty() {
+            return Vec::new();
+        }
+        
+        // 按版本排序
+        versions.sort_by(|(v1, _), (v2, _)| v1.cmp(v2));
+
+        let mut result = Vec::new();
+        
+        // 添加最老的版本
+        if let Some((_, oldest)) = versions.first() {
+            result.push(oldest.clone());
+        }
+        
+        // 如果有多个版本且最新版本不同于最老版本，添加最新版本
+        if versions.len() > 1 {
+            if let Some((newest_ver, newest)) = versions.last() {
+                if newest_ver != &versions.first().unwrap().0 {
+                    result.push(newest.clone());
+                }
+            }
+        }
+        
+        result
+    }
+
+    pub async fn analyze(
+        &self,
+        crate_name: &str,
+        version_range: &str,
+        function_path: &str,
+    ) -> Result<()> {
+        let version_req = self.parse_version_requirement(version_range).unwrap();
+        let versions = self.database.query_crate_versions(crate_name).await?;
+
+        tracing::info!(
+            "Start analyzing crate: {}, version range: {}, {} versions",
+            crate_name,
+            version_req,
+            versions.len()
+        );
+
+        // 筛选符合版本要求的版本
+        let matching_versions = versions
+            .into_iter()
+            .filter_map(|version| {
+                let parsed_version = Version::parse(&version).ok()?;
+                version_req.matches(&parsed_version).then_some((parsed_version, version))
+            })
+            .collect::<Vec<_>>();
+        
+        tracing::info!("找到符合版本要求的版本数: {}", matching_versions.len());
+        
+        // 只取最老和最新的版本（排序已在方法内部完成）
+        let selected_version_strings = self.select_oldest_and_newest_versions(matching_versions);
+        
+        if selected_version_strings.is_empty() {
+            tracing::info!("没有找到符合版本要求的版本");
+            return Ok(());
+        }
+        
+        for (i, version) in selected_version_strings.iter().enumerate() {
+            let is_oldest = i == 0;
+            let is_newest = i == selected_version_strings.len() - 1;
+            let version_type = if is_oldest && is_newest {
+                "唯一版本"
+            } else if is_oldest {
+                "最老版本"
+            } else {
+                "最新版本"
+            };
+            tracing::info!("选择{}: {}", version_type, version);
+        }
+        
+        let bfs_queue = selected_version_strings
+            .into_iter()
+            .map(|version| Krate::new(crate_name, &version))
+            .collect::<VecDeque<_>>();
+
+        self.bfs_from_queue(bfs_queue, function_path).await?;
+
+        Ok(())
+    }
+
+    async fn bfs_from_queue(
+        &self,
+        mut queue: VecDeque<Krate>,
+        target_function_path: &str,
+    ) -> Result<()> {
+        tracing::info!("bfs queue size: {}", queue.len());
+
+        let mut visited = HashSet::new();
+        let mut level = 0;
+
+        // pop current level
+        let pop_bfs_level = |queue: &mut VecDeque<Krate>| -> Vec<Krate> {
+            let mut current_level = Vec::new();
+            while let Some(node) = queue.pop_front() {
+                current_level.push(node);
+            }
+            tracing::info!("BFS弹出一层，共 {} 个节点", current_level.len());
+            current_level
+        };
+
+        // push next level
+        let push_next_level = |queue: &mut VecDeque<Krate>, next_nodes: Vec<Krate>| {
+            let count = next_nodes.len();
+            for node in next_nodes {
+                queue.push_back(node);
+            }
+            tracing::info!("BFS推入下一层，共 {} 个节点", count);
+        };
+
+        // main loop of BFS Algorithm
+        while !queue.is_empty() {
+            level += 1;
+            tracing::info!("BFS第{}层，队列长度:{}", level, queue.len());
+            let current_level = pop_bfs_level(&mut queue);
+            let results = self
+                .process_bfs_level(current_level, target_function_path, &mut visited)
+                .await?;
+            push_next_level(&mut queue, results);
+        }
+        Ok(())
+    }
+
+    async fn process_bfs_level(
+        &self,
+        current_level: Vec<Krate>,
+        target_function_path: &str,
+        visited: &mut HashSet<VisitedCrateVersion>,
+    ) -> Result<Vec<Krate>> {
+        let analyzer = Arc::new(self.clone());
+        let results = stream::iter(current_level)
+            .map(|krate| {
+                let analyzer = Arc::clone(&analyzer);
+                let target_function_path = target_function_path.to_string();
+                async move {
+                    let _permit = analyzer.semaphore.acquire().await.unwrap();
+                    analyzer
+                        .process_single_bfs_node(krate, &target_function_path)
+                        .await
+                }
+            })
+            .buffer_unordered(MAX_CONCURRENT_TASKS) // 使用常量
+            .collect::<Vec<_>>()
+            .await;
+
+        let mut next_nodes = Vec::new();
+        let mut total_new = 0;
+        for result in results {
+            if let Ok(nodes) = result {
+                total_new += nodes.len();
+                for node in nodes {
+                    let cv = VisitedCrateVersion {
+                        name: node.name().to_string(),
+                        version: node.version().to_string(),
+                    };
+                    if visited.insert(cv) {
+                        next_nodes.push(node);
+                    }
+                }
+            }
+        }
+        tracing::info!("process_bfs_level: 本层发现新节点:{}", total_new);
+        Ok(next_nodes)
+    }
+
+    async fn process_single_bfs_node(
+        &self,
+        krate: Krate,
+        target_function_path: &str,
+    ) -> Result<Vec<Krate>> {
+        let node_start_time = std::time::Instant::now();
+        tracing::info!("准备查询依赖者: {} {}", krate.name(), krate.version());
+
+        // 查询前日志
+        tracing::info!(
+            "即将调用 query_dependents for {} {}",
+            krate.name(),
+            krate.version()
+        );
+        let precise_version = &krate.version();
+        let reverse_dependencies = self.database.query_dependents(&krate.name()).await?;
+        let reverse_dependencies_for_certain_version =
+            Self::filter_dependents_by_version_req(reverse_dependencies, precise_version);
+
+        let krate = Arc::new(krate); // 用 Arc 包裹
+        tracing::info!(
+            "query_dependents 返回 for {} {}",
+            krate.name(),
+            krate.version()
+        );
+
+        // 对每个crate名称的不同版本只选择最老和最新的
+        let mut dependents_by_name: std::collections::HashMap<String, Vec<(Version, ReverseDependency)>> = 
+            std::collections::HashMap::new();
+        
+        // 按crate名称分组并解析版本
+        for dep in reverse_dependencies_for_certain_version {
+            if let Ok(version) = Version::parse(&dep.version) {
+                dependents_by_name
+                    .entry(dep.name.clone())
+                    .or_insert_with(Vec::new)
+                    .push((version, dep));
+            }
+        }
+        
+        // 对每个crate名称，按版本排序并只选最老和最新版本
+        let mut selected_dependents = Vec::new();
+        let mut total_crates = 0;
+        let mut total_versions = 0;
+        
+        for (name, versions) in dependents_by_name {
+            total_crates += 1;
+            let versions_count = versions.len();
+            total_versions += versions_count;
+            
+            // 选择最老和最新版本（排序已在方法内部完成）
+            let selected = self.select_oldest_and_newest_versions(versions);
+            let selected_count = selected.len();
+            
+            tracing::info!(
+                "依赖者 {} 有{}个版本，选择了{}个版本进行分析", 
+                name, 
+                versions_count, 
+                selected_count
+            );
+            
+            selected_dependents.extend(selected);
+        }
+        
+        let selected_dependents_count = selected_dependents.len();
+        tracing::info!(
+            "共有{}个crate依赖，筛选后剩余{}个版本进行分析",
+            total_crates,
+            selected_dependents_count
+        );
+
+        let mut next_nodes = Vec::new();
+
+        let mut total_progress_idx = 0;
+        for (batch_idx, batch) in selected_dependents.chunks(BATCH_SIZE).enumerate() {
+            tracing::info!("开始处理第{}批, 本批{}个依赖者", batch_idx + 1, batch.len());
+            let batch_vec = batch.to_vec();
+            let selected_dependents_len = selected_dependents.len();
+            let batch_results = stream::iter(batch_vec.into_iter().enumerate())
+                .map(|(idx, reverse_dependency)| {
+                    let reverse_name = reverse_dependency.name.clone();
+                    let reverse_version = reverse_dependency.version.clone();
+                    let req_for_dep = reverse_dependency.req.clone();
+
+                    let analyzer = self.clone();
+                    let target_function_path = target_function_path.to_string();
+                    let krate = Arc::clone(&krate);
+                    
+                    total_progress_idx += 1;
+                    tracing::info!("[依赖者进度 {}/{}] 正在分析依赖者: {} {}", total_progress_idx, selected_dependents_len, reverse_name, reverse_version);
+                    async move {
+                        let _permit = analyzer.semaphore.acquire().await.unwrap();
+                        let dep_krate = Krate::new(&reverse_name, &reverse_version);
+                        let dep_dir = match dep_krate.get_crate_dir_path().await {
+                            Ok(dir) => dir,
+                            Err(e) => {
+                                tracing::warn!("[{}-{}] get_crate_dir_path失败: {}，跳过", reverse_name, reverse_version, e);
+                                return None;
+                            }
+                        };
+
+                        tracing::info!("[{}-{}] 开始 patch_cargo_toml_with_parent", reverse_name, reverse_version);
+                        
+                        let patch_result = timeout(
+                            Duration::from_secs(60),
+                            Krate::patch_cargo_toml_with_parent(&dep_dir, &krate.name(), &krate.version())
+                        ).await;
+
+                        if let Ok(Ok(_)) = patch_result {
+                            tracing::info!("[{}-{}] patch_cargo_toml_with_parent 成功", reverse_name, reverse_version);
+                        } else {
+                            tracing::warn!("[{}-{}] patch_cargo_toml_with_parent 失败，跳过该crate", reverse_name, reverse_version);
+                            return None;
+                        }
+                        
+                        tracing::info!("[{}-{}] 开始 is_valid_dependent", reverse_name, reverse_version);
+                        let is_valid = analyzer
+                            .is_valid_dependent(
+                                &krate.version(),
+                                &req_for_dep,
+                                &reverse_name,
+                                &reverse_version,
+                                target_function_path.as_str(),
+                            )
+                            .await
+                            .unwrap_or(false);
+                        tracing::info!("[{}-{}] is_valid_dependent结果: {}", reverse_name, reverse_version, is_valid);
+
+                        // 分析结束后删除 Cargo.lock
+                        let cargo_lock_path = dep_dir.join("Cargo.lock");
+                        let _ = tokio_fs::remove_file(&cargo_lock_path).await;
+
+                        if is_valid {
+                            tracing::info!("依赖者 {} {} 满足条件，加入下一层", reverse_name, reverse_version);
+                            Some(dep_krate)
+                        } else {
+                            tracing::info!("依赖者 {} {} 不满足条件，跳过", reverse_name, reverse_version);
+                            None
+                        }
+                    }
+                })
+                .buffer_unordered(MAX_CONCURRENT_TASKS)
+                .collect::<Vec<_>>()
+                .await;
+
+            tracing::info!(
+                "第{}批处理完成，成功节点数: {}",
+                batch_idx + 1,
+                batch_results.iter().filter(|x| x.is_some()).count()
+            );
+            next_nodes.extend(batch_results.into_iter().filter_map(|x| x));
+        }
+
+        Ok(next_nodes)
+    }
+
+    /// 根据依赖表达式筛选能匹配precise_version的依赖者
+    fn filter_dependents_by_version_req(
+        dependents: Vec<ReverseDependency>,
+        precise_version: &str,
+    ) -> Vec<ReverseDependency> {
+        let precise_version_parsed = semver::Version::parse(precise_version).ok();
+        let filtered_dependents: Vec<ReverseDependency> = dependents
+            .into_iter()
+            .filter(|dep| {
+                if let (Some(ver), Ok(dep_req)) = (
+                    precise_version_parsed.as_ref(),
+                    semver::VersionReq::parse(&dep.req),
+                ) {
+                    dep_req.matches(ver)
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        tracing::info!(
+            "filtered_dependents共得到符合版本要求的crate共 {} 个",
+            filtered_dependents.len()
+        );
+        filtered_dependents
+    }
+
+    fn get_original_dir(&self) -> PathBuf {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    }
+
+    // 主函数改名为更具体的名字
+    async fn analyze_function_calls(
         &self,
         crate_name: &str,
         crate_version: &str,
         function_path: &str,
     ) -> Option<String> {
-        info!(
-            "检查 crate {} {} 是否调用了函数 {}",
-            crate_name, crate_version, function_path
-        );
+        // info!(
+        //     "开始分析 crate {} {} 的函数调用: {}",
+        //     crate_name, crate_version, function_path
+        // );
 
-        let krate = Krate::new(crate_name.to_string(), crate_version.to_string());
+        let krate = Krate::new(crate_name, crate_version);
+        let original_dir = self.get_original_dir();
 
-        // 保存原始工作目录
-        let original_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        info!("原始工作目录: {}", original_dir.display());
-
-        // 下载并解压crate
-        let crate_dir = match krate.get_crate_dir_path().await {
+        // 准备分析环境
+        let crate_dir = match self
+            .prepare_analysis_environment(&krate, &original_dir)
+            .await
+        {
             Ok(dir) => dir,
             Err(e) => {
-                warn!("无法下载或解压 crate: {} {}", crate_name, crate_version);
-                // 返回原始工作目录
-                if std::env::set_current_dir(&original_dir).is_err() {
-                    warn!("无法返回原始工作目录: {}", original_dir.display());
-                }
+                // warn!("准备分析环境失败: {}", e);
                 return None;
             }
         };
 
-        // 进入crate目录
-        if std::env::set_current_dir(&crate_dir).is_err() {
-            warn!("无法进入crate目录: {}", crate_dir.display());
-            // 返回原始工作目录
-            if std::env::set_current_dir(&original_dir).is_err() {
-                warn!("无法返回原始工作目录: {}", original_dir.display());
-            }
-            return None;
-        }
+        // 运行函数调用分析工具
+        let analysis_result = self.run_function_analysis(&crate_dir, function_path).await;
 
-        // 检查当前工作目录
-        let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        info!("当前工作目录: {}", current_dir.display());
-
-        // 列出当前目录内容
-        if let Ok(mut entries) = tokio_fs::read_dir(".").await {
-            info!("当前目录内容:");
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                if let Ok(path) = entry.path().into_os_string().into_string() {
-                    info!("  {}", path);
-                }
-            }
-        }
-
-        // 运行call-cg4rs工具
-        info!("运行call-cg4rs工具");
-
-        // 检查tmp目录权限
-        let tmp_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        info!("当前工作目录: {}", tmp_dir.display());
-
-        let call_cg_result = Command::new("call-cg4rs")
-            .args(&["--find-callers", function_path, "--json-output"]) // 移除 --quiet 以查看更多输出
-            .output()
+        // 清理环境并返回结果
+        let result = self
+            .cleanup_and_return_result(&krate, &crate_dir, &original_dir, analysis_result)
             .await;
 
-        if let Err(e) = call_cg_result {
-            warn!("运行call-cg4rs工具失败: {}", e);
-            // 返回原始工作目录
-            if std::env::set_current_dir(&original_dir).is_err() {
-                warn!("无法返回原始工作目录: {}", original_dir.display());
+        // 如果分析成功且有结果，保存到项目目录
+        if let Some(_) = &result {
+            if let Err(e) = self
+                .save_analysis_result(crate_name, crate_version, &crate_dir)
+                .await
+            {
+                warn!("保存分析结果失败: {}", e);
             }
-            return None;
         }
 
-        if let Ok(output) = call_cg_result {
-            info!("call-cg4rs 退出码: {}", output.status);
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                warn!("call-cg4rs工具执行失败: {}", stderr);
-                // 返回原始工作目录
-                if std::env::set_current_dir(&original_dir).is_err() {
-                    warn!("无法返回原始工作目录: {}", original_dir.display());
-                }
-                return None;
-            }
-
-            // 检查JSON输出
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            info!("call-cg4rs输出长度: {}", stdout.len());
-
-            // 记录运行call-cg4rs后的目录内容
-            info!("运行call-cg4rs后的目录内容:");
-            if let Ok(mut entries) = tokio_fs::read_dir(".").await {
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    if let Ok(path) = entry.path().into_os_string().into_string() {
-                        info!("  {}", path);
-                    }
-                }
-            }
-
-            // 检查当前目录中的target目录（在解压后的项目目录中）
-            let target_dir = Path::new("target");
-            if target_dir.exists() {
-                info!("target目录存在");
-
-                // 列出target目录内容
-                if let Ok(mut entries) = tokio_fs::read_dir(target_dir).await {
-                    info!("target目录内容:");
-                    while let Ok(Some(entry)) = entries.next_entry().await {
-                        if let Ok(path) = entry.path().into_os_string().into_string() {
-                            info!("  {}", path);
-                        }
-                    }
-                }
-
-                // 检查callers.json文件
-                let callers_json_path = target_dir.join("callers.json");
-                if callers_json_path.exists() {
-                    info!("callers.json文件存在");
-
-                    // 读取callers.json文件内容
-                    if let Ok(content) = tokio_fs::read_to_string(&callers_json_path).await {
-                        info!("callers.json 内容:");
-                        if let Ok(json) = serde_json::from_str::<Value>(&content) {
-                            info!(
-                                "{}",
-                                serde_json::to_string_pretty(&json).unwrap_or_default()
-                            );
-                        } else {
-                            info!("{}", content);
-                        }
-
-                        // 解析JSON并检查total_callers
-                        if let Ok(json) = serde_json::from_str::<Value>(&content) {
-                            if let Some(total_callers) =
-                                json.get("total_callers").and_then(|v| v.as_i64())
-                            {
-                                if total_callers > 0 {
-                                    info!(
-                                        "crate {} {} 调用了函数 {} (调用者数量: {})",
-                                        crate_name, crate_version, function_path, total_callers
-                                    );
-
-                                    // 保存callers.json内容
-                                    let callers_content = content.clone();
-
-                                    // 返回上级目录
-                                    if std::env::set_current_dir("..").is_err() {
-                                        warn!("无法返回上级目录");
-                                    }
-
-                                    // 清理下载的压缩包和解压后的项目文件夹
-                                    let _ = tokio_fs::remove_file(format!(
-                                        "{}-{}.crate",
-                                        crate_name, crate_version
-                                    ))
-                                    .await;
-                                    let _ = Command::new("rm")
-                                        .args(&["-rf", &crate_dir.to_string_lossy()])
-                                        .output()
-                                        .await;
-
-                                    // 返回原始工作目录
-                                    if std::env::set_current_dir(&original_dir).is_err() {
-                                        warn!("无法返回原始工作目录: {}", original_dir.display());
-                                    }
-
-                                    return Some(callers_content);
-                                }
-
-                            }
-
-                        }
-                    } else {
-                        warn!("无法读取callers.json文件: {}", callers_json_path.display());
-                    }
-                } else {
-                    warn!("callers.json文件不存在: {}", callers_json_path.display());
-                }
-            } else {
-                warn!("target目录不存在");
-            }
-
-            // 返回上级目录
-            if std::env::set_current_dir("..").is_err() {
-                warn!("无法返回上级目录");
-            }
-
-            // 清理下载的压缩包和解压后的项目文件夹
-            let _ = tokio_fs::remove_file(format!("{}-{}.crate", crate_name, crate_version)).await;
-            let _ = Command::new("rm")
-                .args(&["-rf", &crate_dir.to_string_lossy()])
-                .output()
-                .await;
-        }
-
-        // 返回原始工作目录
-        if std::env::set_current_dir(&original_dir).is_err() {
-            warn!("无法返回原始工作目录: {}", original_dir.display());
-        }
-
-        info!(
-            "crate {} {} 没有调用函数 {}",
-            crate_name, crate_version, function_path
-        );
-        None
+        result
     }
 
-    // 处理叶子节点的函数调用分析
-    async fn process_leaf_node(&self, node: &DependencyNode, target_function_path: &str) -> bool {
-        info!("处理叶子节点: {} {}", node.name, node.version);
+    // 准备分析环境
+    async fn prepare_analysis_environment(
+        &self,
+        krate: &Krate,
+        _original_dir: &PathBuf,
+    ) -> Result<PathBuf> {
+        // info!("准备分析环境: {} {}", krate.name(), krate.version());
 
-        // 检查函数调用
-        if let Some(callers_json) = self
-            .check_function_call(&node.name, &node.version, target_function_path)
-            .await
+        // 下载并解压crate（已自动判断是否已存在）
+        let crate_dir = krate.get_crate_dir_path().await.context(format!(
+            "无法下载或解压 crate: {} {}",
+            krate.name(),
+            krate.version()
+        ))?;
+
+        info!("crate目录已就绪: {}", crate_dir.display());
+        Ok(crate_dir)
+    }
+
+    // 运行函数调用分析工具
+    async fn run_function_analysis(
+        &self,
+        crate_dir: &PathBuf,
+        function_path: &str,
+    ) -> Result<Option<String>> {
+        let src_dir = crate_dir.join("src");
+        if !self
+            .check_src_contain_target_function(&src_dir.to_string_lossy(), function_path)
+            .await?
         {
-            // 获取当前工作目录的绝对路径
-            let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-
-            // 创建结果文件名
-            let result_filename = format!("{}-{}-callers.json", node.name, node.version);
-            let result_path = current_dir.join("target").join(&result_filename);
-
-            // 确保 target 目录存在
-            if let Some(parent) = result_path.parent() {
-                if let Err(e) = tokio_fs::create_dir_all(parent).await {
-                    warn!("创建目录失败: {}", e);
-                    return false;
-                }
-            }
-
-            // 写入结果文件
-            if let Err(e) = tokio_fs::write(&result_path, &callers_json).await {
-                warn!("写入结果文件失败: {}", e);
-                return false;
-            }
-
-            info!("已保存结果到: {}", result_path.display());
-
-            return true;
+            return Ok(None);
         }
 
-        false
-    }
-
-    // 处理叶子节点的函数调用分析 - 使用异步并行
-    async fn process_leaf_nodes_parallel(
-        &self,
-        nodes: Vec<DependencyNode>,
-        target_function_path: &str,
-    ) {
-        info!("开始并行处理 {} 个叶子节点", nodes.len());
-
-        let analyzer = Arc::new(self.clone());
-        let target_function_path = target_function_path.to_string();
-
-        // 创建任务并发限制
-        let max_concurrent_tasks = 64;
-
-        // 使用StreamExt的buffer_unordered进行并发处理
-        let results = stream::iter(nodes)
-            .map(|node| {
-                let analyzer = Arc::clone(&analyzer);
-                let target_path = target_function_path.clone();
-                async move { analyzer.process_leaf_node(&node, &target_path).await }
-            })
-            .buffer_unordered(max_concurrent_tasks)
-            .collect::<Vec<_>>()
-            .await;
-
-        let successful = results.iter().filter(|&&result| result).count();
         info!(
-            "所有叶子节点处理完成，成功处理: {}/{}",
-            successful,
-            results.len()
-        );
-    }
-
-    // 查找所有依赖者
-    pub async fn find_all_dependents(
-        &self,
-        start_crate: &str,
-        version_range: &str,
-        target_function_path: &str,
-    ) -> Result<Vec<DependencyNode>> {
-        info!(
-            "开始BFS查找所有依赖者: {} {} 目标函数: {}",
-            start_crate, version_range, target_function_path
+            "!!! 检查到目标函数{}，开始运行函数调用分析工具",
+            function_path
         );
 
-        let mut visited = HashSet::new();
-        let mut queue = VecDeque::new();
-        let mut leaf_nodes = Vec::new();
+        let manifest_path = crate_dir.join("Cargo.toml");
+        let output_dir = crate_dir.join("target"); // 工具生成在 crate 目录下
 
-        // 解析版本范围
-        let version_req = VersionReq::parse(version_range)
-            .map_err(|e| anyhow::anyhow!("解析版本范围失败: {}", e))?;
+        let mut cmd = Command::new("call-cg4rs");
+        cmd.args(&[
+            "--find-callers",
+            function_path,
+            "--json-output",
+            "--manifest-path",
+            &manifest_path.to_string_lossy(),
+            "--output-dir",
+            &output_dir.to_string_lossy(),
+        ]);
 
-        // 获取起始crate的所有版本
-        let versions = self.database.query_crate_versions(start_crate).await?;
+        let call_cg_result = cmd.output().await.context("运行call-cg4rs工具失败")?;
 
-        for version in versions {
-            if let Ok(ver) = Version::parse(&version) {
-                if version_req.matches(&ver) {
-                    queue.push_back((start_crate.to_string(), version.clone()));
-                }
-            }
+        if !call_cg_result.status.success() {
+            let stderr = String::from_utf8_lossy(&call_cg_result.stderr);
+            warn!("call-cg4rs工具执行失败: {}", stderr);
+            return Ok(None);
         }
 
-        // BFS遍历
-        while let Some((current_crate, current_version)) = queue.pop_front() {
-            info!("处理 crate: {} version: {}", current_crate, current_version);
-
-            // 查询当前crate-version的所有依赖者
-            let dependents = self.database.query_dependents(&current_crate).await?;
-            let mut node = DependencyNode {
-                name: current_crate.clone(),
-                version: current_version.clone(),
-                dependents: Vec::new(),
-            };
-
-            let mut has_valid_dependents = false;
-
-            // 处理每个依赖者
-            for (dep_name, dep_version, req) in dependents {
-                // 检查版本匹配
-                if let (Ok(ver), Ok(dep_req)) =
-                    (Version::parse(&current_version), VersionReq::parse(&req))
-                {
-                    if dep_req.matches(&ver) {
-                        // 先检查是否调用了目标函数
-                        if self
-                            .check_function_call(&dep_name, &dep_version, target_function_path)
-                            .await
-                            .is_some()
-                        {
-                            info!(
-                                "依赖者 {} {} 调用了目标函数 {}",
-                                dep_name, dep_version, target_function_path
-                            );
-
-                            // 将匹配的依赖关系添加到当前节点
-                            node.dependents
-                                .push((dep_name.clone(), dep_version.clone(), req));
-                            has_valid_dependents = true;
-
-                            // 如果这个依赖者还没访问过，加入队列
-                            let dep_crate_ver = CrateVersion {
-                                name: dep_name.clone(),
-                                version: dep_version.clone(),
-                            };
-                            if !visited.contains(&dep_crate_ver) {
-                                info!("添加新的依赖者到队列: {} {}", dep_name, dep_version);
-                                queue.push_back((dep_name, dep_version));
-                                visited.insert(dep_crate_ver);
-                            }
-                        } else {
-                            info!("依赖者 {} {} 没有调用目标函数，跳过", dep_name, dep_version);
-                        }
-                    }
-                }
-            }
-
-            // 如果是叶子节点（没有有效的dependents），保存结果
-            if !has_valid_dependents {
-                info!("找到叶子节点: {} {}", node.name, node.version);
-                leaf_nodes.push(node);
-            }
+        // 工具生成的 callers.json 路径
+        let callers_json_path = output_dir.join("callers.json");
+        if !callers_json_path.exists() {
+            info!("未找到callers.json文件，说明没有函数调用");
+            return Ok(None);
         }
 
-        // 并行处理所有叶子节点
-        info!("开始处理 {} 个叶子节点", leaf_nodes.len());
-        self.process_leaf_nodes_parallel(leaf_nodes.clone(), target_function_path)
-            .await;
+        // 读取callers.json内容
+        let callers_content =
+            tokio_fs::read_to_string(&callers_json_path)
+                .await
+                .context(format!(
+                    "读取callers.json文件失败: {}",
+                    callers_json_path.display()
+                ))?;
 
-        info!("BFS遍历完成，找到 {} 个叶子节点", leaf_nodes.len());
-        Ok(leaf_nodes)
+        Ok(Some(callers_content))
+    }
+
+    async fn check_src_contain_target_function(
+        &self,
+        src: &str,
+        target_function_path: &str,
+    ) -> Result<bool> {
+        let function_name = target_function_path.split("::").last().unwrap();
+
+        // 获取参数并添加到命令字符串
+        let args: Vec<String> = vec![
+            "-r".to_string(),
+            "-n".to_string(),
+            "--color=always".to_string(),
+            function_name.to_string(),
+            src.to_owned(),
+        ];
+        let mut grep_cmd = Command::new("grep");
+        grep_cmd.args(args);
+        tracing::info!("执行命令: {:?}", grep_cmd);
+        // 调用grep命令执行
+        let output = grep_cmd.output().await?;
+        // 返回grep的退出状态码
+        let status = output.status;
+        if status.success() {
+            return Ok(true);
+        } else {
+            // grep没有找到匹配内容时会返回非零状态码，这里特殊处理
+            if output.stdout.is_empty() && status.code() == Some(1) {
+                return Ok(false);
+            } else {
+                return Err(anyhow::anyhow!("搜索过程出错，退出码: {:?}", status.code()));
+            }
+        }
+    }
+
+    // 保存分析结果到项目目录
+    async fn save_analysis_result(
+        &self,
+        crate_name: &str,
+        crate_version: &str,
+        crate_dir: &PathBuf,
+    ) -> Result<()> {
+        let src_path = crate_dir.join("target").join("callers.json");
+        let result_filename = format!("{}-{}-callers.json", crate_name, crate_version);
+        let dst_path = Path::new("target").join(&result_filename);
+
+        // 确保 target 目录存在
+        if let Some(parent) = dst_path.parent() {
+            tokio_fs::create_dir_all(parent)
+                .await
+                .context("创建target目录失败")?;
+        }
+
+        // 复制文件
+        tokio_fs::copy(&src_path, &dst_path).await.context(format!(
+            "复制callers.json到目标目录失败: {} -> {}",
+            src_path.display(),
+            dst_path.display()
+        ))?;
+
+        info!("已保存结果到: {}", dst_path.display());
+        Ok(())
+    }
+
+    // 清理环境并返回结果
+    async fn cleanup_and_return_result(
+        &self,
+        krate: &Krate,
+        _crate_dir: &PathBuf,
+        _original_dir: &PathBuf,
+        analysis_result: Result<Option<String>>,
+    ) -> Option<String> {
+        // 只清理下载的 .crate 压缩包，不删除解压后的项目文件夹
+        let _ = krate.cleanup_crate_file().await;
+        // 分析后自动 cargo clean，释放 target 空间
+        let _ = krate.cargo_clean().await;
+
+        match analysis_result {
+            Ok(Some(result)) => {
+                info!("crate {} {} 调用了目标函数", krate.name(), krate.version());
+                Some(result)
+            }
+            Ok(None) => {
+                info!(
+                    "crate {} {} 没有调用目标函数",
+                    krate.name(),
+                    krate.version()
+                );
+                None
+            }
+            Err(e) => {
+                warn!(
+                    "分析 crate {} {} 时发生错误: {}",
+                    krate.name(),
+                    krate.version(),
+                    e
+                );
+                None
+            }
+        }
+    }
+
+    // 解析版本要求
+    pub fn parse_version_requirement(&self, version_range: &str) -> Result<VersionReq> {
+        VersionReq::parse(version_range).map_err(|e| anyhow::anyhow!("解析版本范围失败: {}", e))
+    }
+
+    // 检查依赖者是否有效（版本匹配且调用了目标函数）
+    async fn is_valid_dependent(
+        &self,
+        current_version: &str,
+        req: &str,
+        dep_name: &str,
+        dep_version: &str,
+        target_function_path: &str,
+    ) -> Result<bool> {
+        if let (Ok(ver), Ok(dep_req)) = (Version::parse(current_version), VersionReq::parse(req)) {
+            if dep_req.matches(&ver) {
+                let has_function_call = self
+                    .analyze_function_calls(dep_name, dep_version, target_function_path)
+                    .await
+                    .is_some();
+                if has_function_call {
+                    info!(
+                        "依赖者 {} {} 版本匹配且调用了目标函数",
+                        dep_name, dep_version
+                    );
+                } else {
+                    info!(
+                        "依赖者 {} {} 版本匹配但未调用目标函数",
+                        dep_name, dep_version
+                    );
+                }
+                return Ok(has_function_call);
+            }
+        }
+        Ok(false)
     }
 }

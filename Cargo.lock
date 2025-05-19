@@ -177,6 +177,7 @@ dependencies = [
  "env_logger",
  "futures",
  "futures-util",
+ "once_cell",
  "petgraph",
  "semver",
  "serde",
