@@ -39,10 +39,12 @@ impl Krate {
         self.version.clone()
     }
 
+    #[allow(dead_code)]
     pub fn dependents(&self) -> &Vec<Krate> {
         &self.dependents
     }
 
+    #[allow(dead_code)]
     pub fn dependents_mut(&mut self) -> &mut Vec<Krate> {
         &mut self.dependents
     }
@@ -226,7 +228,7 @@ impl Krate {
         let _download_permit = DOWNLOAD_SEMAPHORE.acquire().await.unwrap();
 
         let extract_dir_path = self.get_extract_dir_path();
-        let key = format!("{}-{}", self.name, self.version);
+        let _key = format!("{}-{}", self.name, self.version);
 
         tracing::info!(
             "get_crate_dir_path: extract_dir_path={}",

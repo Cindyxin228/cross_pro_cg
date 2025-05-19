@@ -288,6 +288,7 @@ impl DependencyAnalyzer {
         );
 
         let mut next_nodes = Vec::new();
+        let mut total_progress_idx = 0;
 
         for (batch_idx, batch) in selected_dependents.chunks(BATCH_SIZE).enumerate() {
             tracing::info!("开始处理第{}批, 本批{}个依赖者", batch_idx + 1, batch.len());
@@ -303,7 +304,8 @@ impl DependencyAnalyzer {
                     let target_function_path = target_function_path.to_string();
                     let krate = Arc::clone(&krate);
                     
-                    tracing::info!("[依赖者进度 {}/{}] 正在分析依赖者: {} {}", idx + 1, selected_dependents_len, reverse_name, reverse_version);
+                    total_progress_idx += 1;
+                    tracing::info!("[依赖者进度 {}/{}] 正在分析依赖者: {} {}", total_progress_idx, selected_dependents_len, reverse_name, reverse_version);
                     async move {
                         let _permit = analyzer.semaphore.acquire().await.unwrap();
                         let dep_krate = Krate::new(&reverse_name, &reverse_version);
@@ -316,28 +318,19 @@ impl DependencyAnalyzer {
                         };
 
                         tracing::info!("[{}-{}] 开始 patch_cargo_toml_with_parent", reverse_name, reverse_version);
-                        let mut patch_success = false;
-                        for attempt in 0..2 {
-                            let patch_result = timeout(
-                                Duration::from_secs(60),
-                                Krate::patch_cargo_toml_with_parent(&dep_dir, &krate.name(), &krate.version())
-                            ).await;
+                        
+                        let patch_result = timeout(
+                            Duration::from_secs(60),
+                            Krate::patch_cargo_toml_with_parent(&dep_dir, &krate.name(), &krate.version())
+                        ).await;
 
-                            if let Ok(Ok(_)) = patch_result {
-                                patch_success = true;
-                                break; // 成功
-                            } else {
-                                tracing::warn!("[{}-{}] patch失败，第{}次重试", reverse_name, reverse_version, attempt + 1);
-                                panic!("patch失败，第{}次重试", attempt + 1);
-                                //tokio::time::sleep(Duration::from_secs(2)).await;
-                            }
-                        }
-                        if !patch_success {
-                            tracing::warn!("[{}-{}] patch_cargo_toml_with_parent连续2次失败，跳过该crate后续分析", reverse_name, reverse_version);
+                        if let Ok(Ok(_)) = patch_result {
+                            tracing::info!("[{}-{}] 完成 patch_cargo_toml_with_parent", reverse_name, reverse_version);
+                        } else {
+                            tracing::warn!("[{}-{}] patch_cargo_toml_with_parent失败，跳过该crate后续分析", reverse_name, reverse_version);
                             return None;
                         }
-                        tracing::info!("[{}-{}] 完成 patch_cargo_toml_with_parent", reverse_name, reverse_version);
-
+                        
                         tracing::info!("[{}-{}] 开始 is_valid_dependent", reverse_name, reverse_version);
                         let is_valid = analyzer
                             .is_valid_dependent(
